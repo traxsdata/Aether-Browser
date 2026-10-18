@@ -233,6 +233,40 @@ impl<'a> Canvas<'a> {
         pen - x
     }
 
+    /// An anti-aliased polyline `t` px wide (icons in the chrome).
+    pub fn stroke(&mut self, pts: &[(f32, f32)], t: f32, c: Color) {
+        if pts.len() < 2 {
+            return;
+        }
+        let r = t / 2.0;
+        let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for &(x, y) in pts {
+            x0 = x0.min(x);
+            y0 = y0.min(y);
+            x1 = x1.max(x);
+            y1 = y1.max(y);
+        }
+        let area = Rect::new((x0 - r - 1.0).floor() as i32, (y0 - r - 1.0).floor() as i32, (x1 - x0 + t + 3.0).ceil() as i32, (y1 - y0 + t + 3.0).ceil() as i32).intersect(&self.clip);
+        for py in area.y..area.y + area.h {
+            for px in area.x..area.x + area.w {
+                let (fx, fy) = (px as f32 + 0.5, py as f32 + 0.5);
+                let mut d = f32::MAX;
+                for w in pts.windows(2) {
+                    let ((ax, ay), (bx, by)) = (w[0], w[1]);
+                    let (vx, vy) = (bx - ax, by - ay);
+                    let l2 = vx * vx + vy * vy;
+                    let k = if l2 > 0.0 { (((fx - ax) * vx + (fy - ay) * vy) / l2).clamp(0.0, 1.0) } else { 0.0 };
+                    let (dx, dy) = (fx - (ax + k * vx), fy - (ay + k * vy));
+                    d = d.min((dx * dx + dy * dy).sqrt());
+                }
+                let cov = (r + 0.5 - d).clamp(0.0, 1.0);
+                if cov > 0.0 {
+                    self.put(px, py, c, (cov * 255.0) as u32);
+                }
+            }
+        }
+    }
+
     /// A small picture icon (frame, hills and a sun) for image placeholders.
     pub fn picture_icon(&mut self, x: i32, y: i32, c: Color) {
         let s = 14;
