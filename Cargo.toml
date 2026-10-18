@@ -1,0 +1,12 @@
+[package]
+name = "browser"
+version = "0.5.0"
+edition = "2021"
+publish = false
+description = "æther's web browser: a from-scratch HTML/CSS engine with no JavaScript"
+
+[dependencies]
+aether-host = { path = "../aether-host" }
+# The network layer. The stub has the real crate's API and no network; to
+# use the real one, point this at "../webnet".
+webnet = { path = "../webnet-stub" }
