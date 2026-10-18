@@ -234,6 +234,13 @@ impl Builder<'_> {
         let Some(ps) = map.get(&n).cloned() else { return };
         if let Some(text) = ps.content.clone() {
             let c = self.child_ctx(n, &ps, ctx, true);
+            if matches!(ps.position, crate::css::style::Position::Absolute | crate::css::style::Position::Fixed) && ps.display != Display::None {
+                // An out-of-flow generated box: its own block, placed by the line.
+                let mut b = LBox::new(ps.clone(), None, Kind::Block);
+                self.push_text(&text, &ps, atomic_ctx(c), &mut b.inlines);
+                out.push(Inl::Atomic(Box::new(b), None));
+                return;
+            }
             self.push_text(&text, &ps, c, out);
         }
     }

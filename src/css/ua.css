@@ -72,7 +72,9 @@ fieldset { margin: 0 2px; padding: .35em .75em .625em; border: 2px solid #c0c0c0
 legend { padding: 0 2px }
 summary { display: block }
 details:not([open]) > :not(summary) { display: none }
-details > summary:first-of-type { display: list-item; list-style-type: disc }
+details > summary:first-of-type { display: block }
+details > summary:first-of-type::before { content: "\25B6\00A0\00A0"; font-size: 0.75em }
+details[open] > summary:first-of-type::before { content: "\25BC\00A0\00A0" }
 
 input, select, textarea, button { font-size: 13px; color: black }
 input, textarea, select { border: 1px solid #8f95a8; border-radius: 4px; padding: 3px 6px; background: white }

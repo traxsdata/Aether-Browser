@@ -7,4 +7,6 @@ pub mod font;
 mod font_data;
 pub mod html;
 pub mod layout;
+pub mod net;
+pub mod page;
 pub mod paint;

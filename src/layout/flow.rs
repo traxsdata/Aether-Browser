@@ -13,6 +13,10 @@ pub struct Flow {
     pub vw: f32,
     pub vh: f32,
     pub(crate) depth: usize,
+    /// Padding (top, right, bottom, left) of the box whose content is being
+    /// laid out: absolutely positioned children are placed against its
+    /// padding box.
+    pub(crate) pad: [f32; 4],
 }
 
 /// The result of laying out one box.
@@ -28,7 +32,7 @@ pub struct Laid {
 }
 
 pub fn layout_document(out: BuildOutput, vw: f32, vh: f32) -> Page {
-    let mut f = Flow { items: Vec::new(), links: out.links, vw, vh, depth: 0 };
+    let mut f = Flow { items: Vec::new(), links: out.links, vw, vh, depth: 0, pad: [0.0; 4] };
     let root = &out.root;
     let s = &root.style;
     // The canvas takes the root's background, or else the body's.
@@ -291,6 +295,7 @@ impl Flow {
         let cw = (w - hz.inner()).max(0.0);
         let vpad = pt + pb + bt + bb;
         let spec_h = s.height.resolve(cbh).map(|h| if s.border_box { (h - vpad).max(0.0) } else { h.max(0.0) });
+        let saved_pad = std::mem::replace(&mut self.pad, [pt, hz.pr, pb, hz.pl]);
         let (mut ch, first, last) = match &b.kind {
             Kind::Block => {
                 if !b.children.is_empty() {
@@ -307,6 +312,7 @@ impl Flow {
                 (h, None, None)
             }
         };
+        self.pad = saved_pad;
         if let Some(h) = spec_h {
             ch = h;
         }
@@ -396,8 +402,47 @@ impl Flow {
         let mut prev_mb: f32 = 0.0;
         let mut first = None;
         let mut last = None;
+        let mut bottom_placed: Vec<(usize, usize, f32, f32, f32)> = Vec::new();
         for (i, c) in children.iter().enumerate() {
             let s = &c.style;
+            if matches!(s.position, Position::Absolute | Position::Fixed) {
+                // Out of flow: placed against the parent's content box (an
+                // approximation of the nearest positioned ancestor), taking
+                // no space. Static position when no offsets are given.
+                let [pt, pr, pb, pl] = self.pad;
+                let (px0, py0, pw) = (cx - pl, cy - pt, cw + pl + pr);
+                let pbh = cbh.map(|h| h + pt + pb);
+                let left = s.inset[3].resolve(Some(pw));
+                let right = s.inset[1].resolve(Some(pw));
+                let top = s.inset[0].resolve(pbh);
+                let bottom = s.inset[2].resolve(pbh);
+                let hz = Hz::of(s, pw);
+                let cw = pw;
+                let w = match (left, right) {
+                    (Some(l), Some(r)) if s.width.is_auto() => (cw - l - r - hz.ml.or_zero(Some(cw)) - hz.mr.or_zero(Some(cw))).max(hz.inner()),
+                    _ => self.box_width(c, cw, false),
+                };
+                let ml = hz.ml.or_zero(Some(cw));
+                let mt = s.margin[0].or_zero(Some(cw));
+                let x = match (left, right) {
+                    (Some(l), _) => px0 + l + ml,
+                    (None, Some(r)) => px0 + cw - r - w - hz.mr.or_zero(Some(cw)),
+                    _ => cx + ml,
+                };
+                let static_y = y + prev_mb.max(0.0) + mt;
+                let ay = match top {
+                    Some(t) => py0 + t + mt,
+                    None => static_y,
+                };
+                let start = self.items.len();
+                let laid = self.layout_box(c, x.clamp(-1e5, 1e5), ay.clamp(-1e5, 1e6), w, cw, None);
+                if top.is_none() {
+                    if let Some(bm) = bottom {
+                        bottom_placed.push((start, self.items.len(), laid.h, bm + s.margin[2].or_zero(Some(cw)) - pb, ay));
+                    }
+                }
+                continue;
+            }
             let mt = s.margin[0].or_zero(Some(cw));
             let mb = s.margin[2].or_zero(Some(cw));
             let stretch = !matches!(c.kind, Kind::Replaced(_) | Kind::Table(_));
@@ -428,6 +473,11 @@ impl Flow {
             }
         }
         y += prev_mb.max(0.0);
+        let total = cbh.unwrap_or(y - cy).max(0.0);
+        for (start, end, h, bm, ay) in bottom_placed {
+            let want = cy + total - bm - h;
+            self.shift_from_range(start, end, 0.0, (want - ay).clamp(-1e5, 1e5));
+        }
         ((y - cy).max(0.0), first, last)
     }
 

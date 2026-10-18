@@ -6,7 +6,7 @@ use std::rc::Rc;
 
 use super::flow::{Flow, Laid};
 use super::*;
-use crate::css::style::{TextAlign, VAlign};
+use crate::css::style::{Position, TextAlign, VAlign};
 
 #[derive(Debug)]
 enum P<'a> {
@@ -96,6 +96,8 @@ struct AtomicInfo {
     end: usize,
     laid: Laid,
     valign: VAlign,
+    /// Absolutely positioned: takes no space in the line.
+    abs: bool,
 }
 
 #[derive(Debug)]
@@ -171,7 +173,8 @@ impl Flow {
                 let start = self.items.len();
                 let laid = self.layout_box(ab, 0.0, 0.0, w, cw, None);
                 let end = self.items.len();
-                atomics.push(Some(AtomicInfo { w, ml, mr, mt, mb, start, end, laid, valign: st.valign }));
+                let abs = matches!(st.position, Position::Absolute | Position::Fixed);
+                atomics.push(Some(AtomicInfo { w, ml, mr, mt, mb, start, end, laid, valign: st.valign, abs }));
             } else {
                 atomics.push(None);
             }
@@ -179,7 +182,7 @@ impl Flow {
         let width_of = |i: usize, p: &P| -> f32 {
             match p {
                 P::Word { w, .. } | P::Space { w, .. } | P::Open { w, .. } | P::Close { w } => *w,
-                P::Atomic { .. } => atomics[i].as_ref().map_or(0.0, |a| a.w + a.ml + a.mr),
+                P::Atomic { .. } => atomics[i].as_ref().map_or(0.0, |a| if a.abs { 0.0 } else { a.w + a.ml + a.mr }),
                 P::Break { .. } => 0.0,
             }
         };
@@ -408,7 +411,22 @@ impl Flow {
                         flush(self, &mut run);
                         let a = atomics[p.idx].as_ref().unwrap();
                         let (asc, _) = atomic_metrics(a, xh);
-                        let top = base - asc + a.mt;
+                        let mut top = base - asc + a.mt;
+                        let mut px = px;
+                        if a.abs {
+                            // Against the container's padding box.
+                            let st = &atomics_style(&ps[p.idx]);
+                            let [pt, pr, _, pl] = self.pad;
+                            let pw = cw + pl + pr;
+                            if let Some(l) = st.inset[3].resolve(Some(pw)) {
+                                px = cx - pl + l + a.ml;
+                            } else if let Some(r) = st.inset[1].resolve(Some(pw)) {
+                                px = cx - pl + pw - r - a.w - a.mr;
+                            }
+                            if let Some(t) = st.inset[0].resolve(None) {
+                                top = cy - pt + t + a.mt;
+                            }
+                        }
                         self.shift_from_range(a.start, a.end, px, top);
                         if let Some(l) = link {
                             self.push(Item::Hit { x: px, y: top, w: a.w, h: a.laid.h, target: Target::Link(*l) });
@@ -469,5 +487,12 @@ fn atomic_metrics(a: &AtomicInfo, xh: f32) -> (f32, f32) {
             Some(lb) if lb > 0.0 && lb <= a.laid.h => (lb + a.mt, total - lb - a.mt),
             _ => (total, 0.0),
         },
+    }
+}
+
+fn atomics_style<'a>(p: &P<'a>) -> std::rc::Rc<crate::css::Style> {
+    match p {
+        P::Atomic { b, .. } => b.style.clone(),
+        _ => std::rc::Rc::new(crate::css::Style::initial()),
     }
 }
