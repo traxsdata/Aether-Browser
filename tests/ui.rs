@@ -98,13 +98,18 @@ fn hostile_page_cannot_escape() {
         go(&mut st, "test.aether/hostile.html");
         let t = st.page_text();
         assert!(t.contains("A page that tries things"), "{t}");
-        assert!(t.contains("noscript"), "noscript content is shown: {t}");
+        assert!(!t.contains("noscript"), "noscript content is hidden while scripts run: {t}");
         assert!(!t.contains("You should not see this"));
         assert!(!t.contains("alert"));
-        // A javascript: link does nothing.
+        // The endless loop was stopped, the other site's script never loaded,
+        // and the missing function is just an error.
+        let errors = st.script_errors().join("\n");
+        assert!(errors.contains("ran too long"), "{errors}");
+        assert!(errors.contains("steal is not defined"), "{errors}");
+        // A javascript: link runs on the page; its alert only reaches the status line.
         let p = st.find_link("javascript:").unwrap();
         click(&mut st, p);
-        assert!(st.status().contains("disabled"), "{}", st.status());
+        assert!(st.status().starts_with("The page says"), "{}", st.status());
         assert_eq!(st.address(), "https://test.aether/hostile.html");
         // A page can't use the warning page's internal "continue" action.
         let p = st.find_link("about:continue").unwrap();
@@ -185,5 +190,54 @@ fn drawing_doesnt_panic_at_odd_sizes() {
             let mut px = vec![0u32; (w * h) as usize];
             st.draw(&mut px, w, h, w);
         }
+    });
+}
+
+#[test]
+fn scripts_run_and_respond() {
+    big(|| {
+        let mut st = setup();
+        go(&mut st, "test.aether/scripted.html");
+        let t = st.page_text();
+        assert!(t.contains("Scripts and files are running"), "{t}\n{:?}", st.script_errors());
+        assert!(t.contains("Item three"), "{t}");
+        assert!(t.contains("Fetched: hello from the same site"), "{t}");
+        assert!(!t.contains("Scripts are off"), "{t}");
+        // The other site's script never loaded, and its request was refused.
+        assert!(st.window_title().contains("blocked"), "{}", st.window_title());
+        // Clicks reach the page's handlers.
+        let p = st.find_text("Clicked 0 times").unwrap();
+        click(&mut st, p);
+        click(&mut st, p);
+        assert!(st.page_text().contains("Clicked 2 times"), "{}", st.page_text());
+        // Typing fires input events; the page handles its own form.
+        key(&mut st, '\t' as u32, 0);
+        type_text(&mut st, "cats");
+        assert!(st.page_text().contains("Typing: cats"), "{}", st.page_text());
+        key(&mut st, '\n' as u32, 0);
+        assert!(st.page_text().contains("You searched for cats"), "{}", st.page_text());
+        assert_eq!(st.address(), "https://test.aether/scripted.html");
+        // A link the page handles changes the address without loading.
+        let p = st.find_link("elsewhere").unwrap();
+        click(&mut st, p);
+        assert!(st.page_text().contains("Handled by the page"), "{}", st.page_text());
+        assert_eq!(st.address(), "https://test.aether/handled");
+        assert!(st.script_errors().is_empty(), "{:?}", st.script_errors());
+    });
+}
+
+#[test]
+fn scripts_can_be_turned_off_per_site() {
+    big(|| {
+        let mut st = setup();
+        go(&mut st, "test.aether/scripted.html");
+        assert!(st.page_text().contains("are running"));
+        // The scripts button: own -> all -> off (each click reloads).
+        st.toggle_scripts_for_test();
+        st.toggle_scripts_for_test();
+        let t = st.page_text();
+        assert!(t.contains("Waiting for scripts") && t.contains("Scripts are off"), "{t}");
+        st.toggle_scripts_for_test();
+        assert!(st.page_text().contains("are running"));
     });
 }

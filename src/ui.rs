@@ -3,8 +3,12 @@
 //! form interaction, keyboard focus, a status line, and history.
 //!
 //! Pages load on a worker thread so Stop works and the window stays live.
+//! A page's scripts run on this thread, between events: the window hands
+//! them clicks, typing and timers, and applies what they change.
 
+use std::cell::RefCell;
 use std::collections::HashSet;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::Arc;
@@ -19,6 +23,7 @@ use crate::net::{FetchError, Request, Url};
 use crate::page::{self, Fetcher, LoadError, Loaded, Location};
 use crate::paint::{paint_page, Canvas, FormState, Rect};
 use crate::pages;
+use crate::script::{self, EventInit, Mode, NavReq, Policy, Runtime, Setup};
 
 // æther's palette (kernel/wm.c).
 const ACCENT: u32 = 0x38E1F5;
@@ -89,6 +94,12 @@ struct Shown {
     scroll: f32,
     /// Focusable targets in page order, with their first hit rectangle.
     focusables: Vec<(Target, f32, f32, f32, f32)>,
+    /// The page's scripts, when it runs any.
+    rt: Option<Runtime>,
+    /// The focused field and its value when it got focus (for "change").
+    focus_value: Option<(NodeId, String)>,
+    /// The scroll position scripts last heard about.
+    told_scroll: f32,
 }
 
 struct Loading {
@@ -111,6 +122,7 @@ enum Button {
     Back,
     Forward,
     Reload,
+    Scripts,
     Shield,
 }
 
@@ -141,6 +153,15 @@ pub struct State {
     /// The last event changed nothing on screen.
     pub quiet: bool,
     fetcher: Fetcher<'static>,
+    /// Which sites may run scripts (this run of the browser only).
+    policy: Policy,
+    /// What scripts store (localStorage...), kept in memory only.
+    storage: Rc<RefCell<script::Storage>>,
+    /// Navigations scripts started since the user last did something.
+    script_navs: u32,
+    last_tick: u64,
+    /// Counts pages shown (so code can tell the page changed under it).
+    gen: u64,
 }
 
 fn builtin_shown(name: &str, html: &str, kind: Kind, w: i32, h: i32) -> Shown {
@@ -152,7 +173,7 @@ fn builtin_shown(name: &str, html: &str, kind: Kind, w: i32, h: i32) -> Shown {
 fn make_shown(loaded: Loaded, page: Page, kind: Kind) -> Shown {
     let form = page::initial_form(&loaded.doc);
     let focusables = focusables(&page);
-    Shown { loaded, page, form, kind, scroll: 0.0, focusables }
+    Shown { loaded, page, form, kind, scroll: 0.0, focusables, rt: None, focus_value: None, told_scroll: 0.0 }
 }
 
 fn focusables(page: &Page) -> Vec<(Target, f32, f32, f32, f32)> {
@@ -196,6 +217,11 @@ impl State {
             now: 0,
             quiet: false,
             fetcher: page::default_fetcher(),
+            policy: Policy::default(),
+            storage: Rc::default(),
+            script_navs: 0,
+            last_tick: 0,
+            gen: 0,
         }
     }
 
@@ -255,7 +281,7 @@ impl State {
         }
         let lower = t.to_ascii_lowercase();
         if lower.starts_with("javascript:") {
-            self.status = "Scripts are disabled: this browser has no JavaScript.".into();
+            self.status = "Scripts can't be run from the address bar.".into();
             return;
         }
         match Url::from_user_input(t) {
@@ -295,8 +321,17 @@ impl State {
             }
             return;
         }
-        if lower.starts_with("javascript:") {
-            self.status = "Scripts are disabled: this browser has no JavaScript.".into();
+        if let Some(code) = h.get(11..).filter(|_| lower.starts_with("javascript:")) {
+            // The page's own code, as its inline scripts are.
+            let code = page::percent_decode(code);
+            let sh = &mut self.shown;
+            match sh.rt.as_mut() {
+                Some(rt) => {
+                    rt.run_script(&mut sh.loaded.doc, &mut sh.form, &code);
+                    self.apply_effects();
+                }
+                None => self.status = "Scripts are off for this site.".into(),
+            }
             return;
         }
         // In-page links.
@@ -336,6 +371,17 @@ impl State {
     }
 
     fn jump_to_fragment(&mut self, frag: &str) {
+        // Scripts see the new address and a hashchange event.
+        if let (Location::Web(cur), Some(_)) = (&self.shown.loaded.location, &self.shown.rt) {
+            if let Ok(u) = Url::parse(&format!("{}#{frag}", strip_fragment(cur.as_str()))) {
+                let sh = &mut self.shown;
+                if let Some(rt) = sh.rt.as_mut() {
+                    rt.set_url(u);
+                    rt.fire_window(&mut sh.loaded.doc, &mut sh.form, "hashchange");
+                }
+                self.apply_effects();
+            }
+        }
         match page::fragment_target(&self.shown.loaded.doc, frag).and_then(|n| self.shown.page.anchor_y(n)) {
             Some(y) => self.scroll_to(y - 8.0),
             None if frag.is_empty() || frag.eq_ignore_ascii_case("top") => self.scroll_to(0.0),
@@ -398,6 +444,7 @@ impl State {
         }
         self.title = shown.loaded.title.clone();
         self.shown = shown;
+        self.gen += 1;
         self.page_focus = None;
         self.hover_target = None;
         if self.focus == Focus::Address && !self.addr.is_empty() {
@@ -418,8 +465,9 @@ impl State {
         let flag = cancel.clone();
         let host = req.url.host().to_string();
         let fetcher = self.fetcher;
+        let policy = self.policy.clone();
         let spawned = std::thread::Builder::new().name("load".into()).stack_size(32 << 20).spawn(move || {
-            let r = page::load(req, fragment, fetcher, &flag).map(|l| {
+            let r = page::load(req, fragment, fetcher, &flag, &policy).map(|l| {
                 let p = page::lay_out(&l, w, h);
                 (l, p)
             });
@@ -443,7 +491,7 @@ impl State {
 
     /// Checks on a load in progress; true if something changed.
     pub fn poll(&mut self) -> bool {
-        let Some(l) = &self.loading else { return false };
+        let Some(l) = &self.loading else { return self.tick_scripts() };
         match l.rx.try_recv() {
             Ok(r) => {
                 self.finish_load(r);
@@ -483,6 +531,12 @@ impl State {
                 let frag = loaded.fragment.clone();
                 let shown = make_shown(loaded, pg, Kind::Normal);
                 self.commit(nav, shown, l.push);
+                let before = self.page_id();
+                self.start_scripts();
+                if self.loading.is_some() || before != self.page_id() {
+                    // A script sent the page somewhere else.
+                    return;
+                }
                 if let Some(f) = frag {
                     self.jump_to_fragment(&f);
                 }
@@ -553,9 +607,253 @@ impl State {
         }
     }
 
+    // ---- scripts -------------------------------------------------------------
+
+    fn page_id(&self) -> u64 {
+        self.gen
+    }
+
+    /// Starts the page's scripts (if its site runs any).
+    fn start_scripts(&mut self) {
+        let Location::Web(url) = self.shown.loaded.location.clone() else { return };
+        if !self.shown.loaded.script_mode.runs() || self.shown.kind != Kind::Normal {
+            return;
+        }
+        let scripts = std::mem::take(&mut self.shown.loaded.scripts);
+        let viewport = (self.w as f32, self.view_h());
+        let mut rt = Runtime::new(Setup {
+            url,
+            base: self.shown.loaded.base.clone(),
+            third_party: self.shown.loaded.script_mode == Mode::All,
+            fetcher: Some(self.fetcher),
+            storage: self.storage.clone(),
+            viewport,
+        });
+        rt.set_layout(&self.shown.page, 0.0, viewport);
+        let sh = &mut self.shown;
+        rt.run_page(&mut sh.loaded.doc, &mut sh.form, &scripts);
+        if self.sync_loads {
+            // Headless runs are scripted: let the page settle first.
+            rt.settle(&mut sh.loaded.doc, &mut sh.form, 2000.0);
+        }
+        sh.rt = Some(rt);
+        self.apply_effects();
+    }
+
+    /// Fires an event at a node of the page; false if the page cancelled it.
+    fn fire(&mut self, n: NodeId, ty: &str, init: EventInit) -> bool {
+        let sh = &mut self.shown;
+        match sh.rt.as_mut() {
+            Some(rt) => rt.fire(&mut sh.loaded.doc, &mut sh.form, n, ty, init),
+            None => true,
+        }
+    }
+
+    /// Lays the page out again after scripts changed it.
+    fn relayout(&mut self) {
+        self.shown.page = page::lay_out(&self.shown.loaded, self.w as f32, self.view_h());
+        self.shown.focusables = focusables(&self.shown.page);
+        let s = self.shown.scroll;
+        self.scroll_to(s);
+        let t = self.shown.loaded.doc.title();
+        if t != self.shown.loaded.title {
+            self.shown.loaded.title = t.clone();
+            self.title = t;
+        }
+        let viewport = (self.w as f32, self.view_h());
+        if let Some(rt) = self.shown.rt.as_mut() {
+            rt.set_layout(&self.shown.page, self.shown.scroll, viewport);
+        }
+    }
+
+    /// Applies what the page's scripts asked for. True if the window changed.
+    fn apply_effects(&mut self) -> bool {
+        let Some(rt) = self.shown.rt.as_mut() else { return false };
+        let fx = rt.take_effects();
+        let mut changed = fx.repaint;
+        if fx.relayout {
+            self.relayout();
+            changed = true;
+        }
+        if let Some((u, replace)) = fx.url_changed {
+            self.shown.loaded.location = Location::Web(u.clone());
+            self.shown.loaded.base = Some(u.clone());
+            let (bare, frag) = split_fragment(u);
+            let nav = Nav::Web { url: bare, allow_http: self.shown.loaded.allow_http, fragment: frag };
+            if replace {
+                self.history[self.index].nav = nav;
+            } else {
+                self.history[self.index].scroll = self.shown.scroll;
+                self.history.truncate(self.index + 1);
+                self.history.push(Entry { nav, scroll: 0.0 });
+                if self.history.len() > 200 {
+                    self.history.remove(0);
+                }
+                self.index = self.history.len() - 1;
+            }
+            if self.focus != Focus::Address {
+                self.addr = self.address_text();
+                self.addr_caret = self.addr.len();
+            }
+            changed = true;
+        }
+        if let Some(f) = fx.focus {
+            match f {
+                Some(n) if self.shown.focusables.iter().any(|t| t.0 == Target::Field(n)) => {
+                    self.focus = Focus::Page;
+                    self.page_focus = Some(Target::Field(n));
+                    self.shown.form.focus = Some(n);
+                    self.shown.focus_value = Some((n, self.shown.form.values.get(&n).cloned().unwrap_or_default()));
+                }
+                Some(_) => {}
+                None => {
+                    self.page_focus = None;
+                    self.shown.form.focus = None;
+                    self.shown.focus_value = None;
+                }
+            }
+            changed = true;
+        }
+        if let Some((_, y)) = fx.scroll {
+            self.scroll_to(y);
+            changed = true;
+        }
+        if let Some(a) = fx.alerts.last() {
+            let a: String = a.split_whitespace().collect::<Vec<_>>().join(" ");
+            self.status = format!("The page says: {}", a.chars().take(200).collect::<String>());
+            changed = true;
+        }
+        if let Some(n) = fx.submit {
+            self.submit_now(n);
+            return true;
+        }
+        if let Some(nav) = fx.nav {
+            self.script_navs += 1;
+            if self.script_navs > 8 {
+                self.status = "The page kept navigating by itself; that was stopped.".into();
+                return true;
+            }
+            match nav {
+                NavReq::Go { url, replace } => self.script_go(&url, replace),
+                NavReq::Reload => self.reload(),
+                NavReq::Back => self.back(),
+                NavReq::Forward => self.forward(),
+            }
+            return true;
+        }
+        changed
+    }
+
+    /// Goes where a script sent the page.
+    fn script_go(&mut self, url: &str, replace: bool) {
+        let Ok(u) = Url::parse(url) else { return };
+        let (u, frag) = split_fragment(u);
+        if let (Some(f), Location::Web(cur)) = (&frag, &self.shown.loaded.location) {
+            if strip_fragment(cur.as_str()) == u.as_str() {
+                let f = f.clone();
+                self.jump_to_fragment(&f);
+                return;
+            }
+        }
+        let allow = self.shown.loaded.allow_http && u.scheme() == "http";
+        self.go(Nav::Web { url: u, allow_http: allow, fragment: frag }, !replace);
+    }
+
+    /// Keyboard focus moves to field `n` (or off the fields): blur, change
+    /// and focus events.
+    fn field_focus(&mut self, n: Option<NodeId>) {
+        let prev = self.shown.focus_value.take();
+        if let Some(rt) = self.shown.rt.as_mut() {
+            rt.set_focus(n);
+        }
+        if self.shown.rt.is_none() {
+            self.shown.focus_value = n.map(|n| (n, String::new()));
+            return;
+        }
+        if let Some((p, old)) = prev {
+            if Some(p) == n {
+                self.shown.focus_value = Some((p, old));
+                return;
+            }
+            let now = self.shown.form.values.get(&p).cloned().unwrap_or_default();
+            if now != old {
+                self.fire(p, "change", EventInit { bubbles: true, ..Default::default() });
+            }
+            self.fire(p, "blur", EventInit::default());
+            self.fire(p, "focusout", EventInit { bubbles: true, ..Default::default() });
+        }
+        if let Some(n) = n {
+            let v = self.shown.form.values.get(&n).cloned().unwrap_or_default();
+            self.shown.focus_value = Some((n, v));
+            self.fire(n, "focus", EventInit::default());
+            self.fire(n, "focusin", EventInit { bubbles: true, ..Default::default() });
+        }
+        self.apply_effects();
+    }
+
+    /// Cycles this site's scripts: own only -> all -> off, and reloads.
+    fn toggle_scripts(&mut self) {
+        let Location::Web(u) = self.shown.loaded.location.clone() else { return };
+        let next = match self.policy.mode_for(&u) {
+            Mode::Site => Mode::All,
+            Mode::All => Mode::Off,
+            Mode::Off => Mode::Site,
+        };
+        self.policy.set(&u, next);
+        self.reload();
+        self.status = scripts_label(next, 0).into();
+    }
+
+    /// Milliseconds until the page's scripts next need to run.
+    pub fn script_wake(&self) -> Option<u32> {
+        let rt = self.shown.rt.as_ref()?;
+        rt.next_due().map(|ms| (ms.ceil() as u32).clamp(15, 60_000))
+    }
+
+    /// Script errors on this page so far (for tests and the status line).
+    pub fn script_errors(&self) -> Vec<String> {
+        self.shown.rt.as_ref().map(|rt| rt.errors().to_vec()).unwrap_or_default()
+    }
+
+    /// Runs due timers and finished requests; true if the window changed.
+    fn tick_scripts(&mut self) -> bool {
+        if self.shown.rt.is_none() || self.loading.is_some() {
+            return false;
+        }
+        if self.now.saturating_sub(self.last_tick) < 15 && self.last_tick != 0 {
+            return false;
+        }
+        self.last_tick = self.now.max(1);
+        let scroll = self.shown.scroll;
+        let sh = &mut self.shown;
+        let Some(rt) = sh.rt.as_mut() else { return false };
+        if sh.told_scroll != scroll {
+            sh.told_scroll = scroll;
+            rt.set_scroll(scroll);
+            rt.fire_window(&mut sh.loaded.doc, &mut sh.form, "scroll");
+        }
+        let ran = rt.tick(&mut sh.loaded.doc, &mut sh.form);
+        self.apply_effects() || ran && self.shown.rt.is_none()
+    }
+
     // ---- forms --------------------------------------------------------------
 
+    /// A submission the user started: the form's submit event, then the request.
     fn submit(&mut self, from: NodeId) {
+        if self.shown.rt.is_some() {
+            if let Some(f) = page::form_of(&self.shown.loaded.doc, from) {
+                let ok = self.fire(f, "submit", EventInit { bubbles: true, cancelable: true, ..Default::default() });
+                let before = self.page_id();
+                self.apply_effects();
+                if !ok || before != self.page_id() {
+                    return;
+                }
+            }
+        }
+        self.submit_now(from);
+    }
+
+    fn submit_now(&mut self, from: NodeId) {
         if let Some(req) = page::submit_form(&self.shown.loaded, &self.shown.form, from) {
             if req.method == crate::net::Method::Get {
                 let (u, f) = split_fragment(req.url.clone());
@@ -603,6 +901,7 @@ impl State {
                 self.focus = Focus::Page;
                 self.page_focus = Some(t);
                 self.shown.form.focus = Some(n);
+                self.field_focus(Some(n));
             }
             Target::Submit(n) => self.submit(n),
             Target::Check(n) => {
@@ -618,7 +917,7 @@ impl State {
                 let h = self.shown.page.links.get(i as usize).cloned().unwrap_or_default();
                 let lower = h.trim().to_ascii_lowercase();
                 if lower.starts_with("javascript:") {
-                    return "Script link (scripts are disabled)".into();
+                    return if self.shown.rt.is_some() { "Runs a script on this page".into() } else { "Script link (scripts are off for this site)".into() };
                 }
                 if lower.starts_with("about:") {
                     return h.trim().to_string();
@@ -672,6 +971,13 @@ impl State {
         self.shown.focusables = focusables(&self.shown.page);
         let s = frac * self.max_scroll();
         self.scroll_to(s);
+        let viewport = (w as f32, self.view_h());
+        let sh = &mut self.shown;
+        if let Some(rt) = sh.rt.as_mut() {
+            rt.set_layout(&sh.page, sh.scroll, viewport);
+            rt.fire_window(&mut sh.loaded.doc, &mut sh.form, "resize");
+            self.apply_effects();
+        }
     }
 
     fn key(&mut self, key: u32, mods: u32) {
@@ -704,9 +1010,42 @@ impl State {
             self.address_key(key, ctrl);
             return;
         }
-        // A focused text field takes typing.
+        self.script_navs = 0;
+        // A focused text field takes typing (after the page has seen the key).
         if let Some(Target::Field(n)) = self.page_focus {
-            if self.field_key(n, key, ctrl, shift) {
+            if self.shown.rt.is_some() {
+                let init = key_init(key, mods);
+                if !self.fire(n, "keydown", init.clone()) {
+                    self.apply_effects();
+                    return;
+                }
+                let before = self.shown.form.values.get(&n).cloned();
+                let gen = self.gen;
+                let used = self.field_key(n, key, ctrl, shift);
+                if self.gen != gen {
+                    return;
+                }
+                if used && self.shown.form.values.get(&n).cloned() != before {
+                    self.fire(n, "input", EventInit { bubbles: true, ..Default::default() });
+                }
+                self.fire(n, "keyup", init);
+                self.apply_effects();
+                if used {
+                    return;
+                }
+            } else if self.field_key(n, key, ctrl, shift) {
+                return;
+            }
+        }
+        // Other keys go to the page first; it may take them for itself.
+        if self.shown.rt.is_some() {
+            let target = self.shown.loaded.doc.body().unwrap_or(0);
+            let init = key_init(key, mods);
+            let ok = self.fire(target, "keydown", init.clone());
+            self.fire(target, "keyup", init);
+            let gen = self.gen;
+            self.apply_effects();
+            if !ok || gen != self.gen {
                 return;
             }
         }
@@ -784,6 +1123,8 @@ impl State {
         let (t, _, y, _, h) = self.shown.focusables[next];
         self.page_focus = Some(t);
         self.shown.form.focus = if let Target::Field(n) = t { Some(n) } else { None };
+        let f = self.shown.form.focus;
+        self.field_focus(f);
         self.status = self.describe(t);
         // Keep it in view.
         let vh = self.view_h();
@@ -872,17 +1213,26 @@ impl State {
 
     // ---- pointer -----------------------------------------------------------
 
-    fn button_rects(&self) -> [(Button, Rect); 4] {
+    fn button_rects(&self) -> [(Button, Rect); 5] {
         [
             (Button::Back, Rect::new(10, 10, 32, 32)),
             (Button::Forward, Rect::new(46, 10, 32, 32)),
             (Button::Reload, Rect::new(82, 10, 32, 32)),
+            (Button::Scripts, Rect::new(self.w - 80, 10, 32, 32)),
             (Button::Shield, Rect::new(self.w - 44, 10, 32, 32)),
         ]
     }
 
     fn address_rect(&self) -> Rect {
-        Rect::new(124, 9, (self.w - 124 - 54).max(40), 34)
+        Rect::new(124, 9, (self.w - 124 - 90).max(40), 34)
+    }
+
+    /// This page's scripts setting (None: a page that never runs scripts).
+    fn script_mode(&self) -> Option<Mode> {
+        match (&self.shown.loaded.location, &self.shown.kind) {
+            (Location::Web(u), Kind::Normal) => Some(self.policy.mode_for(u)),
+            _ => None,
+        }
     }
 
     fn scrollbar(&self) -> Option<(Rect, Rect)> {
@@ -925,6 +1275,10 @@ impl State {
                     Button::Forward => "Forward",
                     Button::Reload => "Reload",
                     Button::Shield => "Security and privacy",
+                    Button::Scripts => match self.script_mode() {
+                        Some(m) => scripts_label(m, self.shown.rt.as_ref().map_or(0, |rt| rt.errors().len())),
+                        None => "Scripts don't run on this page",
+                    },
                 }
                 .into();
             }
@@ -948,6 +1302,7 @@ impl State {
                     }
                 }
                 Button::Shield => self.go(Nav::About("security".into()), true),
+                Button::Scripts => self.toggle_scripts(),
             }
             return;
         }
@@ -991,7 +1346,41 @@ impl State {
         self.focus = Focus::Page;
         self.addr = self.address_text();
         self.addr_all = false;
-        let t = self.shown.page.hit(x as f32, (y - TOOLBAR_H) as f32 + self.shown.scroll);
+        self.script_navs = 0;
+        let (px, py) = (x as f32, (y - TOOLBAR_H) as f32 + self.shown.scroll);
+        let t = self.shown.page.hit(px, py);
+        if self.shown.rt.is_some() {
+            // The page hears the click first, and can cancel what it would do.
+            let node = self.shown.page.node_at(px, py).or(match t {
+                Some(Target::Field(n) | Target::Submit(n) | Target::Check(n)) => Some(n),
+                _ => None,
+            });
+            if let Some(n) = node {
+                let init = EventInit { bubbles: true, cancelable: true, client: Some((x as f32, (y - TOOLBAR_H) as f32)), ..Default::default() };
+                let gen = self.gen;
+                self.fire(n, "mousedown", init.clone());
+                self.fire(n, "mouseup", init.clone());
+                if let Some(Target::Check(c)) = t {
+                    // A checkbox changes, then hears the click (which can undo it).
+                    let was = self.shown.form.checked.clone();
+                    self.toggle(c);
+                    if self.fire(n, "click", init) {
+                        self.fire(c, "input", EventInit { bubbles: true, ..Default::default() });
+                        self.fire(c, "change", EventInit { bubbles: true, ..Default::default() });
+                    } else {
+                        self.shown.form.checked = was;
+                    }
+                    self.page_focus = Some(Target::Check(c));
+                    self.apply_effects();
+                    return;
+                }
+                let ok = self.fire(n, "click", init);
+                self.apply_effects();
+                if !ok || gen != self.gen {
+                    return;
+                }
+            }
+        }
         match t {
             Some(t) => {
                 self.page_focus = None;
@@ -1001,6 +1390,9 @@ impl State {
             None => {
                 self.page_focus = None;
                 self.shown.form.focus = None;
+                if self.shown.rt.is_some() {
+                    self.field_focus(None);
+                }
             }
         }
     }
@@ -1058,9 +1450,11 @@ impl State {
         let can_fwd = self.index + 1 < self.history.len();
         let loading = self.loading.is_some();
         for (b, r) in self.button_rects() {
+            let mode = self.script_mode();
             let enabled = match b {
                 Button::Back => can_back,
                 Button::Forward => can_fwd,
+                Button::Scripts => mode.is_some(),
                 _ => true,
             };
             if self.hover_button == Some(b) && enabled {
@@ -1097,6 +1491,24 @@ impl State {
                     let (nx, ny) = (-ty, tx);
                     let head = [(ex - tx * 4.5 + nx * 3.5, ey - ty * 4.5 + ny * 3.5), (ex + tx * 0.8, ey + ty * 0.8), (ex - tx * 4.5 - nx * 3.5, ey - ty * 4.5 - ny * 3.5)];
                     cv.stroke(&head, 2.0, col);
+                }
+                Button::Scripts => {
+                    // Braces: {} for scripts, cyan for this site's own, violet
+                    // for all, crossed out when off.
+                    let tint = match mode {
+                        Some(Mode::Site) => c(ACCENT),
+                        Some(Mode::All) => c(ACCENT2),
+                        _ => col,
+                    };
+                    let bx = cx - 5.0;
+                    let left = [(bx + 2.5, cy - 8.0), (bx + 0.7, cy - 7.0), (bx, cy - 5.0), (bx, cy - 2.0), (bx - 2.0, cy), (bx, cy + 2.0), (bx, cy + 5.0), (bx + 0.7, cy + 7.0), (bx + 2.5, cy + 8.0)];
+                    let right: Vec<(f32, f32)> = left.iter().map(|&(x, y)| (2.0 * cx - x, y)).collect();
+                    cv.stroke(&left, 1.8, tint);
+                    cv.stroke(&right, 1.8, tint);
+                    cv.fill(Rect::new(cx as i32 - 1, cy as i32 - 1, 2, 2), tint);
+                    if mode == Some(Mode::Off) {
+                        cv.stroke(&[(cx - 9.0, cy + 9.0), (cx + 9.0, cy - 9.0)], 2.0, c(DANGER));
+                    }
                 }
                 Button::Shield => {
                     let s = [(cx, cy - 8.0), (cx + 7.0, cy - 5.0), (cx + 6.0, cy + 2.0), (cx, cy + 8.0), (cx - 6.0, cy + 2.0), (cx - 7.0, cy - 5.0), (cx, cy - 8.0)];
@@ -1253,6 +1665,24 @@ impl State {
         Some(((x + w / 2.0) as i32, (y + h / 2.0 - self.shown.scroll) as i32 + TOOLBAR_H))
     }
 
+    /// Window coordinates of the first text run containing `needle`
+    /// (scrolled into view), for tests.
+    pub fn find_text(&mut self, needle: &str) -> Option<(i32, i32)> {
+        let (x, y, w) = self.shown.page.items.iter().find_map(|it| match it {
+            Item::Text { x, y, text, face, .. } if text.contains(needle) => Some((*x, *y, face.width(text))),
+            _ => None,
+        })?;
+        let vh = self.view_h();
+        if y - 20.0 < self.shown.scroll || y + 10.0 > self.shown.scroll + vh {
+            self.scroll_to(y - vh / 3.0);
+        }
+        Some(((x + w / 2.0) as i32, (y - 5.0 - self.shown.scroll) as i32 + TOOLBAR_H))
+    }
+
+    pub fn toggle_scripts_for_test(&mut self) {
+        self.toggle_scripts();
+    }
+
     pub fn page_text(&self) -> String {
         self.shown.page.text()
     }
@@ -1271,6 +1701,50 @@ impl State {
 
     pub fn is_secure(&self) -> bool {
         self.shown.loaded.secure && matches!(self.shown.kind, Kind::Normal)
+    }
+}
+
+/// The scripts button's description of a mode.
+fn scripts_label(m: Mode, errors: usize) -> &'static str {
+    match (m, errors > 0) {
+        (Mode::Site, false) => "Scripts: on, this site's own only. Click to allow other sites' scripts too.",
+        (Mode::Site, true) => "Scripts: on, this site's own only (some failed). Click to allow other sites' scripts too.",
+        (Mode::All, false) => "Scripts: on, including other sites'. Click to turn scripts off.",
+        (Mode::All, true) => "Scripts: on, including other sites' (some failed). Click to turn scripts off.",
+        (Mode::Off, _) => "Scripts: off for this site. Click to turn them on.",
+    }
+}
+
+/// What a key looks like to a page's scripts.
+fn key_init(key: u32, mods: u32) -> EventInit {
+    let (name, code): (String, u32) = match key {
+        8 => ("Backspace".into(), 8),
+        9 => ("Tab".into(), 9),
+        10 | 13 => ("Enter".into(), 13),
+        27 => ("Escape".into(), 27),
+        abi::KEY_LEFT => ("ArrowLeft".into(), 37),
+        abi::KEY_UP => ("ArrowUp".into(), 38),
+        abi::KEY_RIGHT => ("ArrowRight".into(), 39),
+        abi::KEY_DOWN => ("ArrowDown".into(), 40),
+        abi::KEY_PGUP => ("PageUp".into(), 33),
+        abi::KEY_PGDN => ("PageDown".into(), 34),
+        abi::KEY_HOME => ("Home".into(), 36),
+        abi::KEY_END => ("End".into(), 35),
+        abi::KEY_DELETE => ("Delete".into(), 46),
+        k => match char::from_u32(k) {
+            Some(ch) if !ch.is_control() => (ch.to_string(), ch.to_ascii_uppercase() as u32),
+            _ => ("Unidentified".into(), 0),
+        },
+    };
+    EventInit {
+        bubbles: true,
+        cancelable: true,
+        key: Some(name),
+        key_code: code,
+        shift: mods & abi::MOD_SHIFT != 0,
+        ctrl: mods & abi::MOD_CTRL != 0,
+        alt: mods & abi::MOD_ALT != 0,
+        ..Default::default()
     }
 }
 
@@ -1344,13 +1818,16 @@ pub fn run(mut backend: Box<dyn Backend + Send>, start: Option<String>, fetcher:
             }
             dirty = false;
         }
-        let timeout = if st.is_loading() {
+        let mut timeout = if st.is_loading() {
             Some(40)
         } else if st.wants_caret() {
             Some(530u32.saturating_sub((backend.uptime_ms() - last_blink) as u32).max(1))
         } else {
             None
         };
+        if let Some(w) = st.script_wake() {
+            timeout = Some(timeout.map_or(w, |t| t.min(w)));
+        }
         match backend.wait_event(timeout)? {
             Some(ev) => {
                 if !st.handle(ev) {

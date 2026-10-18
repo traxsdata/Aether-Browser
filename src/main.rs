@@ -1,5 +1,5 @@
-//! Browser - a small, secure web browser for æther. No JavaScript, no
-//! plugins, nothing kept on disk. See docs/BROWSER.md.
+//! Browser - a small, secure web browser for æther. Its own script engine
+//! with tight limits, no plugins, nothing kept on disk. See docs/BROWSER.md.
 //!
 //!   browser [address]
 //!

@@ -3,7 +3,7 @@ name = "browser"
 version = "0.5.0"
 edition = "2021"
 publish = false
-description = "æther's web browser: a from-scratch HTML/CSS engine with no JavaScript"
+description = "æther's web browser: a from-scratch HTML/CSS engine and script engine"
 
 [dependencies]
 aether-host = { path = "../aether-host" }

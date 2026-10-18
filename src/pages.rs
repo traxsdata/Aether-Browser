@@ -62,7 +62,7 @@ pub fn home() -> String {
 <span class="mark"></span>
 <h1>Browser</h1>
 <p class="lead">A quiet window onto the web, for æther.</p>
-<div class="badges"><span class="badge">No JavaScript</span><span class="badge">No plugins</span><span class="badge">No cookies kept</span><span class="badge">https first</span></div>
+<div class="badges"><span class="badge">Scripts kept on a leash</span><span class="badge">No plugins</span><span class="badge">No cookies kept</span><span class="badge">https first</span></div>
 </div>
 <div class="tiles">
 <a class="tile" href="about:security"><b>How you're protected</b><span>What this browser does, and doesn't do, by design.</span></a>
@@ -70,7 +70,7 @@ pub fn home() -> String {
 </div>
 <div class="glass">
 <p><b>Type an address above</b> and press Enter. A bare name like <code>example.com</code> means <code>https://example.com/</code>; plain <code>http://</code> addresses get a warning first.</p>
-<p class="dim">Pages are shown as text and layout: images appear as labelled frames, nothing on a page can run code, and nothing is stored after you close the window.</p>
+<p class="dim">Pages are shown as text and layout: images appear as labelled frames, scripts run only on https and only the site's own unless you choose otherwise, and nothing is stored after you close the window.</p>
 </div>
 <p class="keys"><b>Ctrl+L</b> address &nbsp; <b>Tab</b> next link &nbsp; <b>Space</b> / <b>PgDn</b> scroll &nbsp; <b>Alt+←</b> back &nbsp; <b>Esc</b> stop</p>
 </div>
@@ -91,8 +91,9 @@ ul {{ padding-left: 22px; }}
 <p class="lead">This browser is small on purpose. Most attacks on browsers need a feature it simply doesn't have.</p>
 
 <div class="glass">
-<h2 style="margin-top:0">No JavaScript, at all</h2>
-<p>There is no script engine in this browser. <code>&lt;script&gt;</code> elements are read and thrown away, event attributes like <code>onclick</code> are ignored, and <code>javascript:</code> links do nothing. Pages can't run code, track your pointer, rewrite themselves or open windows. <code>&lt;noscript&gt;</code> content is shown instead, which is what sites provide for browsers like this one.</p>
+<h2 style="margin-top:0">Scripts, on a short leash</h2>
+<p>Pages run scripts in <b>æther script</b>, a JavaScript engine written from scratch for this browser. It runs the site's own scripts on https pages, never on plain http. Scripts can only talk to the site they came from, can't open windows, can't run code made from strings, and are stopped if they run too long. Anything they store is forgotten when you close the window.</p>
+<p class="dim" style="margin-bottom:0">The <code>{{}}</code> button next to the address changes this for a site: the site's own scripts, other sites' scripts too, or none.</p>
 </div>
 
 <h2>What is never kept</h2>
@@ -112,8 +113,8 @@ ul {{ padding-left: 22px; }}
 </ul>
 
 <h2>Built to resist hostile pages</h2>
-<p>The HTML, CSS and URL parsers were written for this browser and are bounded everywhere: nesting depth, element counts, attribute sizes, stylesheet rules, selector work and layout depth all have limits, and malformed input is repaired rather than trusted. A page can be slow or ugly, but it can't make the browser run its code.</p>
-<p class="dim">Engine: HTML tokenizer and tree builder, CSS parser and cascade, block, inline, table and flex layout, painted in Facet. Written from scratch in Rust with no external libraries.</p>
+<p>The HTML, CSS and URL parsers were written for this browser and are bounded everywhere: nesting depth, element counts, attribute sizes, stylesheet rules, selector work and layout depth all have limits, and malformed input is repaired rather than trusted. A page can be slow or ugly, but its scripts run inside budgets they can't escape, in an interpreter that never turns them into machine code.</p>
+<p class="dim">Engine: æther script interpreter, HTML tokenizer and tree builder, CSS parser and cascade, block, inline, table and flex layout, painted in Facet. Written from scratch in Rust with no external libraries.</p>
 </div></body></html>"#
     )
 }

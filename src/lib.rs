@@ -1,5 +1,5 @@
-//! The æther browser engine: HTML, CSS, layout and painting, written from
-//! scratch with no JavaScript at all.
+//! The æther browser engine: HTML, CSS, layout, painting and æther script
+//! (a JavaScript engine), all written from scratch.
 
 pub mod css;
 pub mod dom;

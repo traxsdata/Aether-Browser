@@ -56,6 +56,8 @@ fn file(path: &str) -> Option<(&'static str, Vec<u8>)> {
         Some("html") | Some("htm") => "text/html",
         Some("css") => "text/css",
         Some("txt") => "text/plain",
+        Some("js") => "text/javascript",
+        Some("json") => "application/json",
         Some("png") => "image/png",
         _ => "application/octet-stream",
     };

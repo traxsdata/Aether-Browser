@@ -1,8 +1,9 @@
 //! page.rs - loading a page: fetch, decode, parse, gather stylesheets
 //! (inline and linked, with @import), and lay it out for a viewport.
 //!
-//! Nothing here runs page code: there is no script engine at all. A page is
-//! its markup and its stylesheets, nothing more.
+//! Scripts are fetched here too (when the site may run them), but nothing
+//! runs on this thread: the window runs them once the page is in (see
+//! script::Runtime).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -12,6 +13,7 @@ use crate::html::{self, Charset};
 use crate::layout::{build_tree, layout_document, Page};
 use crate::net::{self, FetchError, Method, Request, Response, Url};
 use crate::paint::FormState;
+use crate::script::{Mode, PageScript, Policy, Source};
 
 /// Limits on what a page may pull in.
 pub const MAX_PAGE_BYTES: usize = 8 << 20;
@@ -19,6 +21,9 @@ pub const MAX_SHEET_BYTES: usize = 2 << 20;
 pub const MAX_SHEETS: usize = 48;
 pub const MAX_IMPORT_DEPTH: usize = 4;
 pub const MAX_INLINE_CSS: usize = 4 << 20;
+pub const MAX_SCRIPTS: usize = 200;
+pub const MAX_SCRIPT_BYTES: usize = 4 << 20;
+pub const MAX_ALL_SCRIPT_BYTES: usize = 24 << 20;
 
 /// Where a page came from.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,6 +80,9 @@ pub struct Loaded {
     /// Subresources that were refused or failed (for the status line).
     pub blocked: Vec<String>,
     pub allow_http: bool,
+    /// What scripts this page may run, and the ones it has, in run order.
+    pub script_mode: Mode,
+    pub scripts: Vec<PageScript>,
 }
 
 /// How the loader reaches the network (tests substitute their own).
@@ -84,8 +92,9 @@ pub fn default_fetcher() -> Fetcher<'static> {
     &net::fetch
 }
 
-/// Fetches and parses `req`'s page and its stylesheets.
-pub fn load(req: Request, fragment: Option<String>, fetch: Fetcher, cancel: &AtomicBool) -> Result<Loaded, LoadError> {
+/// Fetches and parses `req`'s page, its stylesheets and (as `policy`
+/// allows for the site it ends up on) its scripts.
+pub fn load(req: Request, fragment: Option<String>, fetch: Fetcher, cancel: &AtomicBool, policy: &Policy) -> Result<Loaded, LoadError> {
     let allow_http = req.allow_http;
     let mut req = req;
     req.max_bytes = req.max_bytes.min(MAX_PAGE_BYTES);
@@ -108,6 +117,13 @@ pub fn load(req: Request, fragment: Option<String>, fetch: Fetcher, cancel: &Ato
     };
     let mut loaded = finish(Location::Web(resp.url.clone()), doc, charset, resp.secure, resp.status, fragment, Some(fetch), cancel, allow_http)?;
     loaded.secure &= resp.secure;
+    let html = matches!(mime.as_str(), "text/html" | "application/xhtml+xml" | "");
+    if html {
+        loaded.script_mode = policy.mode_for(&resp.url);
+        if loaded.script_mode.runs() {
+            gather_scripts(&mut loaded, fetch, cancel)?;
+        }
+    }
     Ok(loaded)
 }
 
@@ -171,6 +187,8 @@ fn finish(
         fragment,
         blocked: Vec::new(),
         allow_http,
+        script_mode: Mode::Off,
+        scripts: Vec::new(),
     };
     gather_styles(&mut l, fetch, cancel)?;
     Ok(l)
@@ -231,6 +249,102 @@ fn gather_styles(l: &mut Loaded, fetch: Option<Fetcher>, cancel: &AtomicBool) ->
             _ => {}
         }
     }
+    Ok(())
+}
+
+/// The page's scripts: inline ones as they are, external ones fetched (a
+/// few at a time), in the order they run: parser-blocking scripts in
+/// document order, then async and defer ones.
+fn gather_scripts(l: &mut Loaded, fetch: Fetcher, cancel: &AtomicBool) -> Result<(), LoadError> {
+    let (Some(base), Location::Web(page)) = (l.base.clone(), l.location.clone()) else { return Ok(()) };
+    let mut first: Vec<PageScript> = Vec::new();
+    let mut later: Vec<PageScript> = Vec::new();
+    // (index into `first` or `later`, is later, url) for external scripts.
+    let mut wanted: Vec<(bool, usize, Url)> = Vec::new();
+    let mut inline_bytes = 0usize;
+    for n in l.doc.find_all("script") {
+        if first.len() + later.len() >= MAX_SCRIPTS {
+            l.blocked.push("too many scripts; the rest were not loaded".into());
+            break;
+        }
+        let Some(e) = l.doc.element(n) else { continue };
+        if e.foreign || !crate::script::dom::runnable_type(e) {
+            continue;
+        }
+        match e.attr("src").map(|s| s.trim().to_string()) {
+            Some(src) if !src.is_empty() => {
+                let deferred = e.attr("async").is_some() || e.attr("defer").is_some();
+                let list = if deferred { &mut later } else { &mut first };
+                let source = match base.join(&src) {
+                    Err(_) => Source::Refused(format!("{src}: bad address")),
+                    Ok(u) => {
+                        if u.scheme() != "https" && !(l.allow_http && u.scheme() == "http" && page.scheme() == "http") {
+                            Source::Refused(format!("{}: scripts load only over https", u.as_str()))
+                        } else if l.script_mode != Mode::All && !crate::script::dom::same_site(&page, &u) {
+                            Source::Refused(format!("{}: another site's script (allowed with the scripts button)", u.as_str()))
+                        } else {
+                            wanted.push((deferred, list.len(), u));
+                            Source::Refused(String::new())
+                        }
+                    }
+                };
+                list.push(PageScript { node: n, source });
+            }
+            Some(_) => {}
+            None => {
+                let text = l.doc.text_content(n);
+                inline_bytes += text.len();
+                if inline_bytes > MAX_ALL_SCRIPT_BYTES {
+                    continue;
+                }
+                first.push(PageScript { node: n, source: Source::Inline(text) });
+            }
+        }
+    }
+    // Fetch external scripts, six at a time.
+    let mut total = inline_bytes;
+    for batch in wanted.chunks(6) {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(LoadError::Cancelled);
+        }
+        let results: Vec<Result<Response, FetchError>> = std::thread::scope(|sc| {
+            let handles: Vec<_> = batch
+                .iter()
+                .map(|(_, _, u)| {
+                    let mut req = Request::get(u.clone());
+                    req.max_bytes = MAX_SCRIPT_BYTES;
+                    req.allow_http = l.allow_http && u.scheme() == "http";
+                    std::thread::Builder::new().stack_size(4 << 20).spawn_scoped(sc, move || fetch(&req))
+                })
+                .collect();
+            handles.into_iter().map(|h| match h {
+                Ok(h) => h.join().unwrap_or(Err(FetchError::Timeout)),
+                Err(_) => Err(FetchError::Timeout),
+            }).collect()
+        });
+        for ((deferred, i, u), r) in batch.iter().zip(results) {
+            let source = match r {
+                Ok(r) if (200..300).contains(&r.status) => {
+                    if !r.secure {
+                        l.secure = false;
+                    }
+                    total += r.body.len();
+                    if total > MAX_ALL_SCRIPT_BYTES {
+                        Source::Refused(format!("{}: the page's scripts are too big", u.as_str()))
+                    } else {
+                        let text = html::decode_as(r.body.strip_prefix(b"\xEF\xBB\xBF".as_slice()).unwrap_or(&r.body), Charset::Utf8);
+                        Source::Fetched { url: r.url.as_str().to_string(), text }
+                    }
+                }
+                Ok(r) => Source::Refused(format!("{}: HTTP {}", u.as_str(), r.status)),
+                Err(e) => Source::Refused(format!("{}: {e}", u.as_str())),
+            };
+            let list = if *deferred { &mut later } else { &mut first };
+            list[*i].source = source;
+        }
+    }
+    first.extend(later);
+    l.scripts = first;
     Ok(())
 }
 
@@ -326,7 +440,7 @@ pub fn initial_form(doc: &Document) -> FormState {
     f
 }
 
-fn form_of(doc: &Document, n: NodeId) -> Option<NodeId> {
+pub fn form_of(doc: &Document, n: NodeId) -> Option<NodeId> {
     let mut p = doc.parent(n);
     while let Some(x) = p {
         if doc.is(x, "form") {
@@ -479,7 +593,7 @@ mod tests {
     }
 
     fn get(u: &str) -> Result<Loaded, LoadError> {
-        load(Request::get(Url::parse(u).unwrap()), None, &fake, &AtomicBool::new(false))
+        load(Request::get(Url::parse(u).unwrap()), None, &fake, &AtomicBool::new(false), &Policy::default())
     }
 
     #[test]

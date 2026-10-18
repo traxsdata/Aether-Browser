@@ -50,6 +50,31 @@ impl Mode {
     }
 }
 
+/// The user's choices of Mode, per site (for this run of the browser only).
+#[derive(Clone, Debug, Default)]
+pub struct Policy {
+    pub sites: std::collections::HashMap<String, Mode>,
+}
+
+impl Policy {
+    /// Scripts run by default on https sites (their own scripts only), and
+    /// not on plain-http pages, which anyone on the way could have changed.
+    pub fn mode_for(&self, u: &Url) -> Mode {
+        if let Some(m) = self.sites.get(&dom::site_of(u.host())) {
+            return *m;
+        }
+        if u.scheme() == "https" {
+            Mode::Site
+        } else {
+            Mode::Off
+        }
+    }
+
+    pub fn set(&mut self, u: &Url, m: Mode) {
+        self.sites.insert(dom::site_of(u.host()), m);
+    }
+}
+
 /// A script of the page as loaded: its element and its text.
 #[derive(Clone, Debug)]
 pub struct PageScript {
@@ -316,6 +341,19 @@ impl Runtime {
             }
             self.tick(doc, form);
         }
+    }
+
+    /// Runs page code the user started (a javascript: link).
+    pub fn run_script(&mut self, doc: &mut Document, form: &mut FormState, src: &str) {
+        self.lend(doc, form, |it| {
+            Self::task(it, |it| dom::run_source(it, src, None));
+        });
+        self.maybe_gc();
+    }
+
+    /// The page's address changed without a load (a #fragment link).
+    pub fn set_url(&mut self, u: Url) {
+        self.it.host.url = Some(u);
     }
 
     /// Tells the scripts where things are after a layout.
