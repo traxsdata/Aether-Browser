@@ -22,9 +22,11 @@ struct Ctx {
     link: Option<u32>,
     shift: f32,
     bg: Option<Color>,
+    /// The innermost inline element (for scripts' hit testing).
+    elem: Option<NodeId>,
 }
 
-const NO_CTX: Ctx = Ctx { deco: 0, deco_color: None, link: None, shift: 0.0, bg: None };
+const NO_CTX: Ctx = Ctx { deco: 0, deco_color: None, link: None, shift: 0.0, bg: None, elem: None };
 
 struct Builder<'a> {
     doc: &'a Document,
@@ -160,6 +162,7 @@ impl Builder<'_> {
             link: ctx.link,
             hidden: s.hidden,
             node,
+            elem: ctx.elem,
         }
     }
 
@@ -178,6 +181,7 @@ impl Builder<'_> {
                 }
             }
         }
+        c.elem = if inline { Some(n) } else { None };
         if inline {
             match s.valign {
                 VAlign::Sub => c.shift -= s.font_size * 0.25,

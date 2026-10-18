@@ -290,6 +290,7 @@ impl Flow {
         if let Some(n) = b.node {
             self.push(Item::Anchor { y, node: n });
         }
+        let region = b.node.map(|_| self.push(Item::Empty));
         let cx = x + hz.bl + hz.pl;
         let cy = y + bt + pt;
         let cw = (w - hz.inner()).max(0.0);
@@ -329,6 +330,9 @@ impl Flow {
         let h = ch + vpad;
         if let Some(i) = deco {
             self.items[i] = self.deco_item(s, x, y, w, h);
+        }
+        if let (Some(i), Some(node)) = (region, b.node) {
+            self.items[i] = Item::Region { x, y, w, h, node };
         }
         if let Some(i) = clip {
             if s.overflow_hidden && (spec_h.is_some() || s.max_height.resolve(cbh).is_some()) || hz.inner() >= 0.0 {

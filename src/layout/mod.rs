@@ -40,6 +40,8 @@ pub struct TextStyle {
     pub link: Option<u32>,
     pub hidden: bool,
     pub node: Option<NodeId>,
+    /// The innermost inline element the text is in.
+    pub elem: Option<NodeId>,
 }
 
 #[derive(Clone, Debug)]
@@ -161,6 +163,9 @@ pub enum Item {
     ClipPop,
     Hit { x: f32, y: f32, w: f32, h: f32, target: Target },
     Anchor { y: f32, node: NodeId },
+    /// Where an element (or a run of an inline element's text) was put;
+    /// not drawn. Scripts use these for clicks and element sizes.
+    Region { x: f32, y: f32, w: f32, h: f32, node: NodeId },
 }
 
 impl Item {
@@ -173,7 +178,8 @@ impl Item {
             | Item::Image { x, y, .. }
             | Item::Field { x, y, .. }
             | Item::ClipPush { x, y, .. }
-            | Item::Hit { x, y, .. } => {
+            | Item::Hit { x, y, .. }
+            | Item::Region { x, y, .. } => {
                 *x += dx;
                 *y += dy;
             }
@@ -185,7 +191,7 @@ impl Item {
     /// Vertical extent, for culling (None: always processed).
     pub fn y_range(&self) -> Option<(f32, f32)> {
         match self {
-            Item::Deco { y, h, .. } | Item::Rect { y, h, .. } | Item::Image { y, h, .. } | Item::Field { y, h, .. } | Item::Hit { y, h, .. } => {
+            Item::Deco { y, h, .. } | Item::Rect { y, h, .. } | Item::Image { y, h, .. } | Item::Field { y, h, .. } | Item::Hit { y, h, .. } | Item::Region { y, h, .. } => {
                 Some((*y, *y + *h))
             }
             Item::Text { y, face, .. } => Some((*y - face.ascent() - 4.0, *y + face.descent() + 4.0)),
@@ -213,6 +219,31 @@ impl Page {
             Item::Hit { x: hx, y: hy, w, h, target } if x >= *hx && x < hx + w && y >= *hy && y < hy + h => Some(*target),
             _ => None,
         })
+    }
+
+    /// The innermost element at (x, y) in page coordinates.
+    pub fn node_at(&self, x: f32, y: f32) -> Option<NodeId> {
+        self.items.iter().rev().find_map(|it| match it {
+            Item::Region { x: rx, y: ry, w, h, node } if x >= *rx && x < rx + w && y >= *ry && y < ry + h => Some(*node),
+            _ => None,
+        })
+    }
+
+    /// Each element's bounding box (the union of its regions).
+    pub fn node_rects(&self) -> std::collections::HashMap<NodeId, [f32; 4]> {
+        let mut m: std::collections::HashMap<NodeId, [f32; 4]> = std::collections::HashMap::new();
+        for it in &self.items {
+            if let Item::Region { x, y, w, h, node } = it {
+                m.entry(*node)
+                    .and_modify(|r| {
+                        let (x0, y0) = (r[0].min(*x), r[1].min(*y));
+                        let (x1, y1) = ((r[0] + r[2]).max(x + w), (r[1] + r[3]).max(y + h));
+                        *r = [x0, y0, x1 - x0, y1 - y0];
+                    })
+                    .or_insert([*x, *y, *w, *h]);
+            }
+        }
+        m
     }
 
     pub fn anchor_y(&self, node: NodeId) -> Option<f32> {

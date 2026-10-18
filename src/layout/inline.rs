@@ -472,6 +472,11 @@ impl Flow {
         if let Some(l) = ts.link {
             self.push(Item::Hit { x, y: line_y, w, h: line_h, target: Target::Link(l) });
         }
+        if let Some(node) = ts.elem {
+            if !text.trim().is_empty() {
+                self.push(Item::Region { x, y: line_y, w, h: line_h, node });
+            }
+        }
     }
 }
 

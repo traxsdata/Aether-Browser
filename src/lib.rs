@@ -11,5 +11,6 @@ pub mod net;
 pub mod page;
 pub mod pages;
 pub mod paint;
+pub mod script;
 pub mod testserve;
 pub mod ui;

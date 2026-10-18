@@ -452,7 +452,7 @@ pub fn paint_page(cv: &mut Canvas, cache: &mut Cache, page: &Page, ox: i32, oy: 
                     cv.clip = c;
                 }
             }
-            Item::Empty | Item::Hit { .. } | Item::Anchor { .. } => {}
+            Item::Empty | Item::Hit { .. } | Item::Anchor { .. } | Item::Region { .. } => {}
         }
     }
     cv.clip = view;
