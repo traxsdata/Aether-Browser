@@ -1,13 +1,16 @@
 //! Browser behaviour through the window's event handling: navigation,
 //! the http warning, history, links, forms, scrolling and focus. Pages come
-//! from the webnet stub (https://test.aether/ serves runner/browser/testpages).
+//! from browser::testserve (https://test.aether/ is runner/browser/testpages;
+//! no network is used).
 
 use aether_host::{abi, Event, Mouse};
 use browser::ui::State;
 
 fn setup() -> State {
-    std::env::set_var("AETHER_STUB_ROOT", concat!(env!("CARGO_MANIFEST_DIR"), "/testpages"));
-    State::new(1000, 700, true)
+    browser::testserve::set_root(concat!(env!("CARGO_MANIFEST_DIR"), "/testpages").into());
+    let mut st = State::new(1000, 700, true);
+    st.set_fetcher(&browser::testserve::fetch);
+    st
 }
 
 /// Runs `f` on a thread with a large stack, as the browser does.
@@ -82,7 +85,7 @@ fn errors_show_the_fetch_error() {
         go(&mut st, "https://nowhere.example/");
         let t = st.page_text();
         assert!(t.contains("Can't open this page"), "{t}");
-        assert!(t.contains("no network layer"), "{t}");
+        assert!(t.contains("only test.aether is served"), "{t}");
         go(&mut st, "not a valid address");
         assert!(st.page_text().contains("Can't open this page"));
     });

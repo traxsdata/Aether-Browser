@@ -66,7 +66,7 @@ pub fn home() -> String {
 </div>
 <div class="tiles">
 <a class="tile" href="about:security"><b>How you're protected</b><span>What this browser does, and doesn't do, by design.</span></a>
-<a class="tile" href="https://test.aether/"><b>test.aether</b><span>A built-in test page, to check the network layer.</span></a>
+<a class="tile" href="https://example.com/"><b>example.com</b><span>A small page to check that the network works.</span></a>
 </div>
 <div class="glass">
 <p><b>Type an address above</b> and press Enter. A bare name like <code>example.com</code> means <code>https://example.com/</code>; plain <code>http://</code> addresses get a warning first.</p>

@@ -1,5 +1,5 @@
 # Headless screenshots of the browser (see tools/build-browser.sh --shots):
-#   AETHER_STUB_ROOT=runner/browser/testpages AETHER_SCRIPT=this \
+#   BROWSER_TEST_ROOT=runner/browser/testpages AETHER_SCRIPT=this \
 #   AETHER_SHOT_DIR=out browser
 # Dump paths are relative to the current directory.
 frame

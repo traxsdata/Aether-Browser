@@ -37,7 +37,7 @@ impl Location {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum LoadError {
     Fetch(FetchError),
     /// The address couldn't be understood.
@@ -470,10 +470,10 @@ mod tests {
         } else if path.ends_with("/img") {
             ("image/png", b"\x89PNG")
         } else {
-            return Err(FetchError::Offline);
+            return Err(FetchError::Timeout);
         };
         if r.url.scheme() == "http" && !r.allow_http {
-            return Err(FetchError::InsecureHttp);
+            return Err(FetchError::InsecureHttp(r.url.clone()));
         }
         Ok(Response { url: r.url.clone(), status: 200, headers: vec![("Content-Type".into(), ct.into())], body: body.to_vec(), secure: r.url.scheme() == "https" })
     }
@@ -497,7 +497,7 @@ mod tests {
     fn charset_and_types() {
         assert_eq!(get("https://x.test/latin").unwrap().title, "café");
         assert!(matches!(get("https://x.test/img"), Err(LoadError::Unsupported(_))));
-        assert!(matches!(get("http://x.test/page"), Err(LoadError::Fetch(FetchError::InsecureHttp))));
+        assert!(matches!(get("http://x.test/page"), Err(LoadError::Fetch(FetchError::InsecureHttp(_)))));
     }
 
     #[test]

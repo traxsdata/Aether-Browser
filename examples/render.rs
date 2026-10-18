@@ -4,7 +4,7 @@
 //!   cargo run -p browser --example render -- page.html out.png [width] [height]
 //!
 //! Linked stylesheets are read from the HTML file's folder (served as
-//! https://test.aether/ through the webnet stub's AETHER_STUB_ROOT).
+//! https://test.aether/ by browser::testserve, without a network).
 
 use std::sync::atomic::AtomicBool;
 
@@ -23,7 +23,7 @@ fn main() {
     let w: u32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(900);
     let max_h: u32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(4000);
     let dir = path.parent().unwrap_or(std::path::Path::new(".")).canonicalize().unwrap();
-    std::env::set_var("AETHER_STUB_ROOT", &dir);
+    browser::testserve::set_root(dir);
     let name = path.file_name().unwrap().to_string_lossy().to_string();
     let out = args[2].clone();
     let t = std::thread::Builder::new()
@@ -31,7 +31,7 @@ fn main() {
         .spawn(move || {
             let url = Url::parse(&format!("https://test.aether/{name}")).unwrap();
             let t0 = std::time::Instant::now();
-            let l = page::load(Request::get(url), None, page::default_fetcher(), &AtomicBool::new(false)).unwrap_or_else(|e| panic!("{e}"));
+            let l = page::load(Request::get(url), None, &browser::testserve::fetch, &AtomicBool::new(false)).unwrap_or_else(|e| panic!("{e}"));
             for b in &l.blocked {
                 eprintln!("blocked: {b}");
             }

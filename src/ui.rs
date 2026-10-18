@@ -16,7 +16,7 @@ use crate::dom::NodeId;
 use crate::font::{Cache, Face};
 use crate::layout::{Item, Page, Target};
 use crate::net::{FetchError, Request, Url};
-use crate::page::{self, LoadError, Loaded, Location};
+use crate::page::{self, Fetcher, LoadError, Loaded, Location};
 use crate::paint::{paint_page, Canvas, FormState, Rect};
 use crate::pages;
 
@@ -140,6 +140,7 @@ pub struct State {
     pub title: String,
     /// The last event changed nothing on screen.
     pub quiet: bool,
+    fetcher: Fetcher<'static>,
 }
 
 fn builtin_shown(name: &str, html: &str, kind: Kind, w: i32, h: i32) -> Shown {
@@ -194,7 +195,13 @@ impl State {
             sync_loads,
             now: 0,
             quiet: false,
+            fetcher: page::default_fetcher(),
         }
+    }
+
+    /// Where pages come from (tests use a local stand-in).
+    pub fn set_fetcher(&mut self, f: Fetcher<'static>) {
+        self.fetcher = f;
     }
 
     fn view_h(&self) -> f32 {
@@ -410,8 +417,9 @@ impl State {
         let (w, h) = (self.w as f32, self.view_h());
         let flag = cancel.clone();
         let host = req.url.host().to_string();
+        let fetcher = self.fetcher;
         let spawned = std::thread::Builder::new().name("load".into()).stack_size(32 << 20).spawn(move || {
-            let r = page::load(req, fragment, page::default_fetcher(), &flag).map(|l| {
+            let r = page::load(req, fragment, fetcher, &flag).map(|l| {
                 let p = page::lay_out(&l, w, h);
                 (l, p)
             });
@@ -489,7 +497,7 @@ impl State {
             Err(LoadError::Cancelled) => {
                 self.addr = self.address_text();
             }
-            Err(LoadError::Fetch(FetchError::InsecureHttp)) => {
+            Err(LoadError::Fetch(FetchError::InsecureHttp(_))) => {
                 if let Nav::Web { url, fragment, .. } = l.nav {
                     self.interstitial(url, fragment, l.push);
                 }
@@ -1301,13 +1309,14 @@ fn split_for_display(s: &str) -> (&str, &str, &str) {
 }
 
 /// Runs the browser in a window until it's closed.
-pub fn run(mut backend: Box<dyn Backend + Send>, start: Option<String>) -> Result<(), aether_host::Error> {
+pub fn run(mut backend: Box<dyn Backend + Send>, start: Option<String>, fetcher: Fetcher<'static>) -> Result<(), aether_host::Error> {
     let info = backend.display_info();
     let want_w = 1100.min(info.max_client_w).max(320);
     let want_h = 760.min(info.max_client_h).max(240);
     let (win, w, h): (WinHandle, u32, u32) = backend.create_window(want_w, want_h, "Browser")?;
     let sync = backend.name() == "headless";
     let mut st = State::new(w as i32, h as i32, sync);
+    st.set_fetcher(fetcher);
     if let Some(u) = start {
         st.open_typed(&u);
     }

@@ -1,10 +1,9 @@
 //! net.rs - the seam between the browser and æther's network layer.
 //!
 //! Everything the browser knows about the network comes through these
-//! re-exports from the `webnet` crate. While runner/webnet is being written
-//! the dependency points at runner/webnet-stub, a stand-in with the same API
-//! that serves built-in pages and refuses real network addresses; swapping
-//! in the real crate is one line in runner/browser/Cargo.toml.
+//! re-exports from the `webnet` crate (runner/webnet): URLs, HTTP/1.1 and
+//! TLS 1.3, with the kernel resolving names and its firewall deciding every
+//! connection. Tests swap the fetch function for `testserve::fetch`.
 
 pub use webnet::{fetch, FetchError, Method, Request, Response, Url, UrlError};
 
