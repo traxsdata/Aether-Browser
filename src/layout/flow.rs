@@ -799,6 +799,7 @@ impl Flow {
             mr_auto: bool,
             grow: f32,
             shrink: f32,
+            base: f32,
         }
         let mut its: Vec<It> = Vec::new();
         for c in &b.children {
@@ -825,6 +826,7 @@ impl Flow {
                 mr_auto: hz.mr.is_auto(),
                 grow: cs.grow,
                 shrink: cs.shrink,
+                base: basis.min(maxw),
             });
         }
         // Lines.
@@ -857,8 +859,12 @@ impl Flow {
             if free > 0.0 {
                 let total_grow: f32 = its[a..z].iter().map(|i| i.grow).sum();
                 if total_grow > 0.0 {
+                    // Grow from the flex base sizes, then respect min/max.
+                    let base_free = cw - its[a..z].iter().map(|i| if i.grow > 0.0 { i.base } else { i.hypo }).sum::<f32>() - margins - gaps;
                     for (k, it) in its[a..z].iter().enumerate() {
-                        sizes[k] = (sizes[k] + free * it.grow / total_grow).min(it.max);
+                        if it.grow > 0.0 {
+                            sizes[k] = (it.base + base_free.max(0.0) * it.grow / total_grow).clamp(it.min.min(it.max), it.max);
+                        }
                     }
                 }
             } else if free < 0.0 {

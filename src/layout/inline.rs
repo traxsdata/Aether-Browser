@@ -16,7 +16,7 @@ enum P<'a> {
     Atomic { b: &'a LBox, link: Option<u32> },
     Open { ts: &'a Rc<TextStyle>, w: f32, node: Option<NodeId> },
     Close { w: f32 },
-    Break { ts: &'a Rc<TextStyle> },
+    Break,
 }
 
 fn text_w(ts: &TextStyle, s: &str) -> f32 {
@@ -43,7 +43,7 @@ fn pieces(inl: &[Inl]) -> Vec<P<'_>> {
                     }
                     flush_word(&mut word, &mut out, ts);
                     if c == '\n' && ws.keeps_newlines() {
-                        out.push(P::Break { ts });
+                        out.push(P::Break);
                         after_space = true;
                         continue;
                     }
@@ -66,8 +66,8 @@ fn pieces(inl: &[Inl]) -> Vec<P<'_>> {
                 out.push(P::Atomic { b, link: *link });
                 after_space = false;
             }
-            Inl::Br(ts) => {
-                out.push(P::Break { ts });
+            Inl::Br(_) => {
+                out.push(P::Break);
                 after_space = true;
             }
         }
@@ -83,7 +83,7 @@ fn flush_word<'a>(word: &mut String, out: &mut Vec<P<'a>>, ts: &'a Rc<TextStyle>
 }
 
 fn is_break_point(p: &P) -> bool {
-    matches!(p, P::Space { brk: true, .. } | P::Break { .. } | P::Atomic { .. })
+    matches!(p, P::Space { brk: true, .. } | P::Break | P::Atomic { .. })
 }
 
 struct AtomicInfo {
@@ -139,7 +139,7 @@ impl Flow {
                     mn = mn.max(amn + m);
                     line += amx + m;
                 }
-                P::Break { .. } => {
+                P::Break => {
                     mn = mn.max(unit);
                     unit = 0.0;
                     mx = mx.max(line);
@@ -183,7 +183,7 @@ impl Flow {
             match p {
                 P::Word { w, .. } | P::Space { w, .. } | P::Open { w, .. } | P::Close { w } => *w,
                 P::Atomic { .. } => atomics[i].as_ref().map_or(0.0, |a| if a.abs { 0.0 } else { a.w + a.ml + a.mr }),
-                P::Break { .. } => 0.0,
+                P::Break => 0.0,
             }
         };
         // Line breaking.
@@ -210,7 +210,7 @@ impl Flow {
         };
         while i < ps.len() {
             match &ps[i] {
-                P::Break { .. } => {
+                P::Break => {
                     line.push(Placed { idx: i, x, w: 0.0, text: None });
                     finish(&mut line, &mut lines, true);
                     x = 0.0;
@@ -435,7 +435,7 @@ impl Flow {
                             first = Some(base);
                         }
                     }
-                    P::Close { .. } | P::Break { .. } => {}
+                    P::Close { .. } | P::Break => {}
                 }
             }
             flush(self, &mut run);

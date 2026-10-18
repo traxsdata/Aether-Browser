@@ -163,7 +163,7 @@ mod tests {
     fn escaping() {
         let p = error("https://x/<script>", "bad & <b>");
         assert!(p.contains("&lt;script&gt;"));
-        assert!(!p.contains("<b>bad"));
+        assert!(p.contains("bad &amp; &lt;b&gt;"));
         let d = crate::html::parse(&p);
         assert!(d.find("script").is_none());
     }

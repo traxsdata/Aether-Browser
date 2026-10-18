@@ -1231,6 +1231,20 @@ impl State {
         }
     }
 
+    /// Window coordinates of the first link whose href contains `needle`
+    /// (scrolled into view), for tests.
+    pub fn find_link(&mut self, needle: &str) -> Option<(i32, i32)> {
+        let (x, y, w, h) = self.shown.page.items.iter().find_map(|it| match it {
+            Item::Hit { x, y, w, h, target: Target::Link(i) } if self.shown.page.links.get(*i as usize).is_some_and(|l| l.contains(needle)) => Some((*x, *y, *w, *h)),
+            _ => None,
+        })?;
+        let vh = self.view_h();
+        if y < self.shown.scroll || y + h > self.shown.scroll + vh {
+            self.scroll_to(y - vh / 3.0);
+        }
+        Some(((x + w / 2.0) as i32, (y + h / 2.0 - self.shown.scroll) as i32 + TOOLBAR_H))
+    }
+
     pub fn page_text(&self) -> String {
         self.shown.page.text()
     }
