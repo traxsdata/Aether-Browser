@@ -163,6 +163,7 @@ impl Builder<'_> {
             hidden: s.hidden,
             node,
             elem: ctx.elem,
+            clear: s.clear,
         }
     }
 

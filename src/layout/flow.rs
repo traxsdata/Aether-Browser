@@ -17,6 +17,29 @@ pub struct Flow {
     /// laid out: absolutely positioned children are placed against its
     /// padding box.
     pub(crate) pad: [f32; 4],
+    /// The root and body boxes' nodes: their overflow belongs to the
+    /// viewport (the page scrolls), so it never clips them.
+    pub(crate) viewport_nodes: [Option<NodeId>; 2],
+    /// The floats of the block formatting context being laid out, in page
+    /// coordinates. Line boxes and new formatting contexts flow around them.
+    pub(crate) floats: Vec<FloatBox>,
+    /// The next layout_box call starts a new block formatting context
+    /// (table cells, flex and grid items, inline blocks).
+    pub(crate) bfc_next: bool,
+}
+
+/// Most floats one formatting context keeps track of; later ones are laid
+/// out like inline blocks (keeps the per-line search bounded).
+pub const MAX_FLOATS: usize = 512;
+
+/// A float's margin box.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FloatBox {
+    pub left: bool,
+    pub x0: f32,
+    pub x1: f32,
+    pub y0: f32,
+    pub y1: f32,
 }
 
 /// The result of laying out one box.
@@ -32,8 +55,9 @@ pub struct Laid {
 }
 
 pub fn layout_document(out: BuildOutput, vw: f32, vh: f32) -> Page {
-    let mut f = Flow { items: Vec::new(), links: out.links, vw, vh, depth: 0, pad: [0.0; 4] };
     let root = &out.root;
+    let body = root.children.iter().find(|c| c.node.is_some() && matches!(c.kind, Kind::Block)).and_then(|c| c.node);
+    let mut f = Flow { items: Vec::new(), links: out.links, vw, vh, depth: 0, pad: [0.0; 4], viewport_nodes: [root.node, body], floats: Vec::new(), bfc_next: false };
     let s = &root.style;
     // The canvas takes the root's background, or else the body's.
     let mut background = s.background;
@@ -55,6 +79,7 @@ pub fn layout_document(out: BuildOutput, vw: f32, vh: f32) -> Page {
         s.margin[2].or_zero(Some(vw)),
     );
     let w = f.box_width(root, vw, true);
+    f.bfc_next = true;
     let laid = f.layout_box(root, ml, mt, w.min(vw - ml - mr).max(0.0), vw, Some(vh));
     if root_gradient_on_canvas {
         // Don't draw the root's background twice: the canvas has it.
@@ -64,7 +89,42 @@ pub fn layout_document(out: BuildOutput, vw: f32, vh: f32) -> Page {
             }
         }
     }
-    Page { items: f.items, width: vw, height: laid.h + mt + mb, background, links: f.links }
+    // The page scrolls over everything drawn, not just the root's box: pages
+    // often give html and body `height: 100%` and let the content overflow.
+    let height = (laid.h + mt + mb).max(content_bottom(&f.items));
+    Page { items: f.items, width: vw, height, background, links: f.links }
+}
+
+/// The lowest point anything visible reaches, ignoring what overflow
+/// clipping hides.
+pub(crate) fn content_bottom(items: &[Item]) -> f32 {
+    let mut clips: Vec<f32> = Vec::new();
+    let mut bottom: f32 = 0.0;
+    for it in items {
+        match it {
+            Item::ClipPush { y, h, .. } => {
+                let limit = y + h;
+                clips.push(clips.last().map_or(limit, |&c| c.min(limit)));
+            }
+            Item::ClipPop => {
+                clips.pop();
+            }
+            Item::Deco { .. } | Item::Rect { .. } | Item::Text { .. } | Item::Bullet { .. } | Item::Image { .. } | Item::Field { .. } => {
+                if let Some((top, end)) = it.y_range() {
+                    let end = match clips.last() {
+                        Some(&c) if top >= c => continue,
+                        Some(&c) => end.min(c),
+                        None => end,
+                    };
+                    if end.is_finite() && end < 1e6 {
+                        bottom = bottom.max(end);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    bottom
 }
 
 /// Horizontal box metrics resolved against containing width `cw`.
@@ -103,6 +163,18 @@ fn collapse(a: f32, b: f32) -> f32 {
     }
 }
 
+/// Does `b` start a new block formatting context? (Its own floats stay
+/// inside it, and it is placed beside its parent's floats, not under them.)
+pub(crate) fn establishes_bfc(b: &LBox) -> bool {
+    use crate::css::style::Display;
+    let s = &b.style;
+    !matches!(b.kind, Kind::Block)
+        || s.overflow_hidden
+        || s.is_float()
+        || matches!(s.position, Position::Absolute | Position::Fixed)
+        || matches!(s.display, Display::InlineBlock | Display::Flex | Display::Grid | Display::Table | Display::InlineTable | Display::InlineFlex | Display::InlineGrid | Display::TableCell | Display::TableCaption)
+}
+
 /// Pixel value of a length without a containing block (percentages are 0).
 fn px_only(l: Len) -> Option<f32> {
     match l {
@@ -112,6 +184,59 @@ fn px_only(l: Len) -> Option<f32> {
 }
 
 impl Flow {
+    /// The free span [l, r) between floats for a band [y, y + h) of a
+    /// container spanning [x0, x1).
+    pub(crate) fn band(&self, y: f32, h: f32, x0: f32, x1: f32) -> (f32, f32) {
+        let (mut l, mut r) = (x0, x1);
+        let h = h.max(0.01);
+        for f in &self.floats {
+            if f.y0 < y + h && f.y1 > y && f.x0 < x1 && f.x1 > x0 {
+                if f.left {
+                    l = l.max(f.x1);
+                } else {
+                    r = r.min(f.x0);
+                }
+            }
+        }
+        (l, r.max(l))
+    }
+
+    /// The nearest float bottom below `y` among floats in that band, if any.
+    pub(crate) fn next_float_bottom(&self, y: f32, h: f32, x0: f32, x1: f32) -> Option<f32> {
+        let h = h.max(0.01);
+        self.floats
+            .iter()
+            .filter(|f| f.y0 < y + h && f.y1 > y && f.x0 < x1 && f.x1 > x0)
+            .map(|f| f.y1)
+            .fold(None, |a: Option<f32>, b| Some(a.map_or(b, |a| a.min(b))))
+    }
+
+    /// The first y at or below `y` where a band `h` tall has `need` free
+    /// width (or no float in the way): (y, l, r).
+    pub(crate) fn fit(&self, mut y: f32, h: f32, need: f32, x0: f32, x1: f32) -> (f32, f32, f32) {
+        for _ in 0..MAX_FLOATS {
+            let (l, r) = self.band(y, h, x0, x1);
+            if r - l + 0.01 >= need {
+                return (y, l, r);
+            }
+            match self.next_float_bottom(y, h, x0, x1) {
+                Some(b) if b > y => y = b,
+                _ => return (y, l, r),
+            }
+        }
+        let (l, r) = self.band(y, h, x0, x1);
+        (y, l, r)
+    }
+
+    /// Below every float `clear` names.
+    pub(crate) fn clear_y(&self, y: f32, clear: u8) -> f32 {
+        use crate::css::style::{CLEAR_LEFT, CLEAR_RIGHT};
+        self.floats
+            .iter()
+            .filter(|f| (f.left && clear & CLEAR_LEFT != 0) || (!f.left && clear & CLEAR_RIGHT != 0))
+            .fold(y, |y, f| y.max(f.y1))
+    }
+
     pub(crate) fn push(&mut self, it: Item) -> usize {
         self.items.push(it);
         self.items.len() - 1
@@ -273,12 +398,17 @@ impl Flow {
     /// Lays out `b` with its border box at (x, y), `w` wide, in a
     /// containing block `cbw` wide (for percentages) and `cbh` tall (if known).
     pub fn layout_box(&mut self, b: &LBox, x: f32, y: f32, w: f32, cbw: f32, cbh: Option<f32>) -> Laid {
+        let bfc_next = std::mem::take(&mut self.bfc_next);
         if self.depth > MAX_LAYOUT_DEPTH {
             return Laid::default();
         }
         self.depth += 1;
         let s = &b.style;
         let start = self.items.len();
+        // A new block formatting context keeps its floats to itself and
+        // grows to contain them.
+        let bfc = bfc_next || establishes_bfc(b);
+        let outer_floats = if bfc { Some(std::mem::take(&mut self.floats)) } else { None };
         let hz = Hz::of(s, cbw);
         let (bt, bb) = (s.border(0), s.border(2));
         let pt = s.padding[0].or_zero(Some(cbw)).max(0.0);
@@ -286,7 +416,8 @@ impl Flow {
         let has_deco = !s.hidden
             && (!s.background.is_transparent() || s.gradient.is_some() || bt + bb + hz.bl + hz.br > 0.0 || matches!(b.kind, Kind::Replaced(_)));
         let deco = if has_deco { Some(self.push(Item::Empty)) } else { None };
-        let clip = if s.overflow_hidden { Some(self.push(Item::Empty)) } else { None };
+        let viewport = b.node.is_some() && self.viewport_nodes.contains(&b.node);
+        let clip = if s.overflow_hidden && !viewport { Some(self.push(Item::Empty)) } else { None };
         if let Some(n) = b.node {
             self.push(Item::Anchor { y, node: n });
         }
@@ -300,7 +431,7 @@ impl Flow {
         let (mut ch, first, last) = match &b.kind {
             Kind::Block => {
                 if !b.children.is_empty() {
-                    self.block_flow(&b.children, cx, cy, cw, spec_h)
+                    self.block_flow(&b.children, cx, cy, cw, spec_h, s.center_blocks)
                 } else {
                     self.inline_flow(b, cx, cy, cw)
                 }
@@ -314,6 +445,12 @@ impl Flow {
             }
         };
         self.pad = saved_pad;
+        if let Some(outer) = outer_floats {
+            let inner = std::mem::replace(&mut self.floats, outer);
+            if let Some(fb) = inner.iter().map(|f| f.y1).reduce(f32::max) {
+                ch = ch.max(fb - cy);
+            }
+        }
         if let Some(h) = spec_h {
             ch = h;
         }
@@ -401,7 +538,7 @@ impl Flow {
     }
 
     /// Block-level children stacked vertically, with sibling margins collapsed.
-    fn block_flow(&mut self, children: &[LBox], cx: f32, cy: f32, cw: f32, cbh: Option<f32>) -> (f32, Option<f32>, Option<f32>) {
+    fn block_flow(&mut self, children: &[LBox], cx: f32, cy: f32, cw: f32, cbh: Option<f32>, center: bool) -> (f32, Option<f32>, Option<f32>) {
         let mut y = cy;
         let mut prev_mb: f32 = 0.0;
         let mut first = None;
@@ -450,17 +587,45 @@ impl Flow {
             let mt = s.margin[0].or_zero(Some(cw));
             let mb = s.margin[2].or_zero(Some(cw));
             let stretch = !matches!(c.kind, Kind::Replaced(_) | Kind::Table(_));
-            let w = self.box_width(c, cw, stretch);
+            let mut w = self.box_width(c, cw, stretch);
             let hz = Hz::of(s, cw);
-            // Auto margins centre (or right-align) a box narrower than the line.
-            let ml = match (hz.ml, hz.mr) {
-                (Len::Auto, Len::Auto) => ((cw - w) / 2.0).max(0.0),
-                (Len::Auto, r) => (cw - w - r.or_zero(Some(cw))).max(0.0),
-                (l, _) => l.or_zero(Some(cw)),
-            };
             let gap = if i == 0 { mt } else { collapse(prev_mb, mt) };
             y += gap;
-            let laid = self.layout_box(c, cx + ml, y, w, cw, cbh);
+            if s.clear != 0 && !self.floats.is_empty() {
+                // Clearance: below the floats it names (the margin above
+                // counts towards it).
+                let cleared = self.clear_y(y, s.clear);
+                if cleared > y {
+                    y = cleared;
+                }
+            }
+            // A new formatting context goes beside the floats, not under
+            // them: narrower if its width is automatic, else lower down.
+            let (mut lx, mut lw) = (cx, cw);
+            if !self.floats.is_empty() && establishes_bfc(c) {
+                let (l, r) = self.band(y, 1.0, cx, cx + cw);
+                if l > cx || r < cx + cw {
+                    let margins = hz.ml.or_zero(Some(cw)).max(0.0) + hz.mr.or_zero(Some(cw)).max(0.0);
+                    let auto_w = stretch && s.width.is_auto();
+                    let need = if auto_w { self.intrinsic(c).0 + margins } else { w + margins };
+                    let (fy, l, r) = self.fit(y, 1.0, need, cx, cx + cw);
+                    y = fy;
+                    lx = l;
+                    lw = (r - l).max(0.0);
+                    if auto_w {
+                        w = self.box_width(c, lw, stretch);
+                    }
+                }
+            }
+            // Auto margins centre (or right-align) a box narrower than the line.
+            let ml = match (hz.ml, hz.mr) {
+                (Len::Auto, Len::Auto) => ((lw - w) / 2.0).max(0.0),
+                (Len::Auto, r) => (lw - w - r.or_zero(Some(cw))).max(0.0),
+                // <center> and align=center centre narrower blocks too.
+                (l, r) if center && l.or_zero(Some(cw)) == 0.0 && r.or_zero(Some(cw)) == 0.0 => ((lw - w) / 2.0).max(0.0),
+                (l, _) => l.or_zero(Some(cw)),
+            };
+            let laid = self.layout_box(c, lx + ml, y, w, cw, cbh);
             if first.is_none() {
                 first = laid.first_base;
             }
@@ -699,6 +864,7 @@ impl Flow {
         let mut y = cy;
         let mut first = None;
         if let Some(cap) = &t.caption {
+            self.bfc_next = true;
             let laid = self.layout_box(cap, cx, y, cw, cw, None);
             y += laid.h;
             first = laid.first_base;
@@ -752,6 +918,7 @@ impl Flow {
                 let end = (col + span).min(ncols);
                 let w = col_x[end] - spacing - col_x[col];
                 let start = self.items.len();
+                self.bfc_next = true;
                 let laid = self.layout_box(&cell.b, col_x[col], y, w.max(0.0), cw, None);
                 let rspan = cell.rowspan.min(nrows - r).max(1);
                 if rspan == 1 {
@@ -952,6 +1119,7 @@ impl Flow {
                 let mb = c.style.margin[2].or_zero(Some(cw));
                 let w = sizes[i - a];
                 let start = self.items.len();
+                self.bfc_next = true;
                 let laid = self.layout_box(c, cx + x + ml, y + mt, w, cw, None);
                 if first.is_none() {
                     first = laid.first_base;
@@ -1020,6 +1188,7 @@ impl Flow {
             let mt = cs.margin[0].or_zero(Some(cw));
             let mb = cs.margin[2].or_zero(Some(cw));
             y += mt;
+            self.bfc_next = true;
             let laid = self.layout_box(c, cx + x, y, w, cw, None);
             if first.is_none() {
                 first = laid.first_base;
@@ -1115,6 +1284,7 @@ impl Flow {
             let mb = c.style.margin[2].or_zero(Some(cw));
             let iw = if c.style.width.is_auto() { w } else { self.box_width(c, w, true).min(w) };
             let start = self.items.len();
+            self.bfc_next = true;
             let laid = self.layout_box(c, cx + xs[col], y + mt, iw, w, None);
             if first.is_none() {
                 first = laid.first_base;

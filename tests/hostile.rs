@@ -52,6 +52,27 @@ fn deep_nesting() {
         timed("inline-block", 20, "<span style='display:inline-block;padding:1px'>".repeat(5_000) + "x");
         timed("abs", 20, "<div style='position:absolute;bottom:0;right:0'>".repeat(5_000) + "x");
         timed("misnested", 20, "<p><b><table><td><i></p></b>".repeat(5_000));
+        timed("nested floats", 20, "<div style='float:right;width:90%;padding:1px'>".repeat(5_000) + "x");
+        timed("centers", 20, "<center><table><tr><td align=center>".repeat(3_000) + "x");
+    });
+}
+
+#[test]
+fn hostile_floats() {
+    big(|| {
+        // Thousands of floats: each line looks at the floats beside it,
+        // so this must stay bounded (MAX_FLOATS per formatting context).
+        timed("many floats", 30, "<span style='float:left;width:3px;height:3px'></span>word ".repeat(20_000));
+        timed("many right floats", 30, "<img style='float:right' width=1 height=2000 alt=x>".repeat(5_000) + &"text ".repeat(5_000));
+        timed("float stairs", 30, (0..3000).map(|i| format!("<div style='float:{};width:{}px;height:{}px'></div>", if i % 2 == 0 { "left" } else { "right" }, i % 397, i % 113)).collect::<String>() + &"word ".repeat(10_000));
+        timed("clear spam", 30, "<div style='float:left;width:50px;height:50px'></div><div style='clear:both'></div><br clear=all>".repeat(5_000));
+        timed("wider than page", 20, "<div style='float:left;width:1e9px;height:1e9px'></div>x".repeat(100) + &"<p style='overflow:hidden'>y".repeat(100));
+        timed("negative margins", 20, "<div style='float:left;margin:-1e9px;width:10px;height:10px'></div>x".repeat(1000));
+        timed("floats in inline blocks", 20, "<span style='display:inline-block'><span style='float:right'>f</span>t</span>".repeat(5_000));
+        timed("floats in cells", 30, format!("<table>{}</table>", "<tr><td><div style='float:left;width:20px;height:20px'></div>a<td style='overflow:hidden'>b".repeat(2000)));
+        timed("quirks tables", 20, "<table><tr><td>".repeat(2_000) + "x");
+        let h = render(&"<div style='float:left;width:10px;height:100000px'></div>".repeat(3));
+        assert!(h >= 100_000.0, "floats extend the page: {h}");
     });
 }
 
@@ -116,6 +137,8 @@ const PIECES: &[&str] = &[
     "content:'x';", "'>", "<div style='display:inline-block'>", "<div style='display:contents'>", "{", "}", "p{color:red}", "a:hover{", "@media(max-width:1px){",
     "*{margin:0}", ".x>.y+.z~.w{}", "@import 'x.css';", "::before{content:'b'}", "var(--x)", "--x:var(--x);", "calc(1px+", "<caption>", "<col span=9>", "<colgroup>",
     "<tbody>", "<thead>", "<tfoot>", "<marquee>", "<font size=7>", "<center>", "<details open><summary>s", "<base href='https://x/'>", "<title>", "</title>",
+    "float:right;", "clear:both;", "clear:left;", "overflow:hidden;", "<br clear=all>", "<img align=right alt=r width=40 height=40>", "<div align=center>",
+    "text-align:-webkit-center;", "<table align=left>", "</center>",
 ];
 
 #[test]

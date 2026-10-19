@@ -76,6 +76,8 @@ pub struct TextStyle {
     pub node: Option<NodeId>,
     /// The innermost inline element the text is in.
     pub elem: Option<NodeId>,
+    /// For a line break: the `clear` of the <br> (moves below floats).
+    pub clear: u8,
 }
 
 #[derive(Clone, Debug)]
