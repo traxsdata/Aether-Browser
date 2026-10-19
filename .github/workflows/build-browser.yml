@@ -1,0 +1,167 @@
+name: Build the browser
+
+# Every push and pull request: run the tests and build the æther package.
+# Actions -> "Build the browser" -> Run workflow (or
+# `gh workflow run build-browser.yml`) also publishes the package to a release
+# of this repository, which Aether's `make browser` downloads.
+#
+# GitHub rejects release assets whose name ends in .app, so the package is
+# published twice: as browser-<version>-aether-x86_64.aeapp (the package bytes
+# as they are; Aether's tools/fetch-craft-apps.py downloads this one) and as a
+# .app.zip holding the original .app file, for manual download.
+#
+# The browser's aether-host and webnet come from the Aether commit Cargo.lock
+# pins; the Aether checkout below only supplies tools/mkapp.py and the kernel
+# font the font test compares against.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to publish to"
+        required: false
+        default: "browser-latest"
+        type: string
+      aether_ref:
+        description: "Aether branch, tag or commit for the packaging tools"
+        required: false
+        default: "main"
+        type: string
+      publish_release:
+        description: "Publish/update a GitHub release with the package"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: browser-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Test and package
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: browser
+    steps:
+      - name: Check out
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          path: browser
+          persist-credentials: false
+
+      - name: Check out Aether (packaging tools)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: traxsdata/Aether
+          ref: ${{ inputs.aether_ref || 'main' }}
+          path: aether
+          persist-credentials: false
+
+      # The runner image ships rustup; rust-toolchain.toml picks the
+      # toolchain and its targets.
+      - name: Set up Rust
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends binutils jq python3 zip
+
+      # Optimised: the hostile-input tests have time limits meant to catch
+      # blowups in the engine, not the unoptimised build's speed.
+      - name: Test
+        env:
+          AETHER_DIR: ${{ github.workspace }}/aether
+        run: cargo test --release --locked
+
+      - name: Build and package
+        env:
+          AETHER_DIR: ${{ github.workspace }}/aether
+        run: tools/build.sh
+
+      - name: Name the release asset and write metadata
+        run: |
+          set -euo pipefail
+          src=build/browser.app
+          mkdir -p dist
+          name=$(dd if="$src" bs=1 skip=16 count=32 2>/dev/null | tr -d '\000')
+          title=$(dd if="$src" bs=1 skip=48 count=32 2>/dev/null | tr -d '\000')
+          version=$(dd if="$src" bs=1 skip=80 count=32 2>/dev/null | tr -d '\000')
+          source=$(dd if="$src" bs=1 skip=112 count=96 2>/dev/null | tr -d '\000')
+          [ "$name" = browser ] || { echo "::error::$src has package name '$name'"; exit 1; }
+          package="${name}-${version}-aether-x86_64.app"
+          package_asset="${name}-${version}-aether-x86_64.aeapp"
+          asset="${package}.zip"
+          cp "$src" "dist/$package_asset"
+          cp "$src" "dist/$package"
+          (cd dist && zip -q "$asset" "$package")
+          rm "dist/$package"
+          webnet_commit=$(sed -n 's/^source = "git+https:\/\/github.com\/traxsdata\/Aether?branch=main#\([0-9a-f]*\)"/\1/p' Cargo.lock | head -1)
+          jq -n \
+            --arg name "$name" --arg title "$title" --arg version "$version" --arg source "$source" \
+            --arg browser_commit "$(git rev-parse HEAD)" --arg aether_commit "$webnet_commit" \
+            --arg package "$package" --arg package_asset "$package_asset" --arg asset "$asset" \
+            --arg sha256 "$(sha256sum "dist/$asset" | awk '{print $1}')" \
+            --arg package_sha256 "$(sha256sum "$src" | awk '{print $1}')" \
+            --argjson size "$(stat -c %s "dist/$asset")" \
+            --argjson package_size "$(stat -c %s "$src")" \
+            '{apps: [{name:$name,title:$title,version:$version,source:$source,browser_commit:$browser_commit,aether_commit:$aether_commit,package:$package,package_asset:$package_asset,asset:$asset,sha256:$sha256,size:$size,package_sha256:$package_sha256,package_size:$package_size}]}' \
+            > dist/browser.json
+          cat dist/browser.json
+
+      - name: Upload package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: browser
+          path: browser/dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish the package
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: browser-release
+      cancel-in-progress: false
+    steps:
+      - name: Download the package
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: browser
+          path: dist
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --target "$GITHUB_SHA" \
+              --title "Browser for æther" \
+              --notes "Built by the Build the browser workflow. Aether's \`make browser\` downloads the .aeapp package; the .app.zip holds the same package as a .app file for manual download (GitHub does not allow .app release assets). browser.json lists the version, the commits it was built from and the SHA-256."
+          fi
+          # Drop older versions of the package.
+          keep=$(cd dist && ls)
+          gh release view "$TAG" --json assets --jq '.assets[].name' | while read -r a; do
+            if [[ "$a" == browser-[0-9]* ]] && ! grep -qxF "$a" <<< "$keep"; then
+              echo "Deleting stale asset $a"
+              gh release delete-asset "$TAG" "$a" --yes
+            fi
+          done
+          gh release view "$TAG" --json url --jq '.url'
