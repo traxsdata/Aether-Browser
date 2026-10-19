@@ -44,33 +44,37 @@ pub fn about(name: &str) -> Option<String> {
 
 pub fn home() -> String {
     format!(
-        r#"<!doctype html><html><head><title>New page</title><style>{STYLE}
-.hero {{ text-align: center; padding: 34px 24px 8px; }}
-.hero h1 {{ font-size: 44px; margin-top: 12px; }}
-.hero .mark {{ width: 64px; height: 64px; border-radius: 18px; }}
-.tiles {{ display: flex; gap: 16px; margin-top: 22px; }}
+        r#"<!doctype html><html><head><title>New Tab</title><style>{STYLE}
+.hero {{ text-align: center; padding: 42px 24px 8px; }}
+.hero h1 {{ font-size: 46px; margin-top: 14px; letter-spacing: 1px; }}
+.hero .mark {{ width: 72px; height: 72px; border-radius: 20px; }}
+.hero .lead {{ font-size: 18px; }}
+.omnibox {{ max-width: 560px; margin: 24px auto 0; padding: 12px 20px; border-radius: 999px; border: 1px solid #2a3560; background: #0e1428; color: #8c96b8; text-align: left; }}
+.omnibox b {{ color: #e6ecff; font-weight: normal; }}
+.tiles {{ display: flex; gap: 16px; margin: 30px auto 0; max-width: 760px; }}
 .tile {{ flex: 1; display: block; background: #141b36; border: 1px solid #2a3560; border-radius: 14px; padding: 16px 18px; color: #e6ecff; }}
 .tile b {{ display: block; color: #38e1f5; margin-bottom: 4px; }}
 .tile span {{ color: #8c96b8; font-size: 14px; }}
-.keys {{ margin-top: 18px; font-size: 14px; color: #8c96b8; text-align: center; }}
+.keys {{ margin-top: 24px; font-size: 14px; color: #8c96b8; text-align: center; }}
 .keys b {{ color: #e6ecff; background: #1a2344; border-radius: 5px; padding: 1px 6px; font-weight: normal; }}
-.badges {{ text-align: center; margin-top: 10px; }}
+.badges {{ text-align: center; margin-top: 12px; }}
 .badge {{ display: inline-block; border: 1px solid #2a3560; border-radius: 999px; padding: 3px 12px; margin: 4px; font-size: 13px; color: #5cf2b0; background: #10243a; }}
 </style></head><body>
-<div class="wrap" style="padding-top: 20px; padding-bottom: 12px">
+<div class="wrap" style="padding-top: 12px; padding-bottom: 12px">
 <div class="hero">
 <span class="mark"></span>
-<h1>Browser</h1>
-<p class="lead">A quiet window onto the web, for æther.</p>
-<div class="badges"><span class="badge">Scripts kept on a leash</span><span class="badge">No plugins</span><span class="badge">No cookies kept</span><span class="badge">https first</span></div>
+<h1>æther</h1>
+<p class="lead">A quieter window onto the web.</p>
+<div class="badges"><span class="badge">Scripts on a leash</span><span class="badge">No plugins</span><span class="badge">Nothing kept</span><span class="badge">https first</span></div>
+<div class="omnibox">Type an address in the bar above and press <b>Enter</b>.</div>
 </div>
 <div class="tiles">
 <a class="tile" href="about:security"><b>How you're protected</b><span>What this browser does, and doesn't do, by design.</span></a>
 <a class="tile" href="https://example.com/"><b>example.com</b><span>A small page to check that the network works.</span></a>
 </div>
-<div class="glass">
-<p><b>Type an address above</b> and press Enter. A bare name like <code>example.com</code> means <code>https://example.com/</code>; plain <code>http://</code> addresses get a warning first.</p>
-<p class="dim">Pages are shown as text and layout: images appear as labelled frames, scripts run only on https and only the site's own unless you choose otherwise, and nothing is stored after you close the window.</p>
+<div class="glass" style="margin-top: 26px">
+<p><b>Tabs work the way you expect.</b> <b>Ctrl+T</b> opens one, <b>Ctrl+W</b> closes it, <b>Ctrl+Tab</b> moves between them, and <b>Ctrl+1</b> to <b>Ctrl+9</b> jumps to a tab. Each tab keeps its own history and its own script choice.</p>
+<p class="dim" style="margin-bottom:0">Pages are HTML and CSS with pictures, decoded by the browser's own PNG, JPEG, GIF and BMP decoders. Scripts run only on https and only the site's own unless you choose otherwise, and nothing is stored after you close the window.</p>
 </div>
 <p class="keys"><b>Ctrl+L</b> address &nbsp; <b>Tab</b> next link &nbsp; <b>Space</b> / <b>PgDn</b> scroll &nbsp; <b>Alt+←</b> back &nbsp; <b>Esc</b> stop</p>
 </div>
@@ -101,7 +105,7 @@ ul {{ padding-left: 22px; }}
 <li><span class="no">No persistent cookies or storage.</span> Nothing a site sends is written to disk: no cookies, no local storage, no cache. Closing the window forgets everything.</li>
 <li><span class="no">No plugins or extensions,</span> and no downloads: files that aren't pages are not saved.</li>
 <li><span class="no">No downloaded fonts.</span> Every page is drawn in Facet, æther's own font, so fonts can't be used to fingerprint you or to exploit a font parser.</li>
-<li><span class="no">No images are decoded.</span> Images are shown as frames with their description, which keeps image decoders out of reach.</li>
+<li><span class="ok">Pictures are decoded in the browser.</span> PNG, baseline JPEG, GIF and BMP use small Rust decoders written for æther, with per-picture dimensions, total pixels and total bytes capped. SVG, WebP and progressive JPEG are not rendered yet: those pictures keep their description instead.</li>
 </ul>
 
 <h2>Connections</h2>
@@ -114,7 +118,7 @@ ul {{ padding-left: 22px; }}
 
 <h2>Built to resist hostile pages</h2>
 <p>The HTML, CSS and URL parsers were written for this browser and are bounded everywhere: nesting depth, element counts, attribute sizes, stylesheet rules, selector work and layout depth all have limits, and malformed input is repaired rather than trusted. A page can be slow or ugly, but its scripts run inside budgets they can't escape, in an interpreter that never turns them into machine code.</p>
-<p class="dim">Engine: æther script interpreter, HTML tokenizer and tree builder, CSS parser and cascade, block, inline, table and flex layout, painted in Facet. Written from scratch in Rust with no external libraries.</p>
+<p class="dim">Engine: æther script interpreter, HTML tokenizer and tree builder, CSS parser and cascade, block, inline, table and flex layout, PNG/JPEG/GIF/BMP decoders, painted in Facet. Written from scratch in Rust with no external libraries.</p>
 </div></body></html>"#
     )
 }

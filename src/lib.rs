@@ -6,6 +6,7 @@ pub mod dom;
 pub mod font;
 mod font_data;
 pub mod html;
+pub mod image;
 pub mod layout;
 pub mod net;
 pub mod page;

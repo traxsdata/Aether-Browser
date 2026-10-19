@@ -227,6 +227,92 @@ fn scripts_run_and_respond() {
 }
 
 #[test]
+fn tabs_keep_separate_pages_and_history() {
+    big(|| {
+        let mut st = setup();
+        go(&mut st, "test.aether/article.html");
+        assert!(st.page_text().contains("Lighthouse"));
+        assert_eq!(st.tab_count(), 1);
+        // Ctrl+T opens a new tab on about:home, with an empty address bar.
+        key(&mut st, 't' as u32, abi::MOD_CTRL);
+        assert_eq!(st.tab_count(), 2);
+        assert_eq!(st.active_tab(), 1);
+        assert_eq!(st.address(), "");
+        assert!(st.page_text().contains("quieter window"), "{}", st.page_text());
+        go(&mut st, "test.aether/listings.html");
+        assert!(st.page_text().contains("Branches"));
+        // Ctrl+1 and Ctrl+2 switch without losing either page.
+        key(&mut st, '1' as u32, abi::MOD_CTRL);
+        assert_eq!(st.active_tab(), 0);
+        assert!(st.page_text().contains("Lighthouse"));
+        key(&mut st, '2' as u32, abi::MOD_CTRL);
+        assert!(st.page_text().contains("Branches"));
+        // Ctrl+Tab wraps back to the first tab.
+        key(&mut st, '\t' as u32, abi::MOD_CTRL);
+        assert_eq!(st.active_tab(), 0);
+        // Closing the first tab keeps the window and selects the other one.
+        assert!(st.handle(Event::Key { key: 'w' as u32, mods: abi::MOD_CTRL }));
+        assert_eq!(st.tab_count(), 1);
+        assert!(st.page_text().contains("Branches"));
+        // Closing the last tab asks the window to close.
+        assert!(!st.handle(Event::Key { key: 'w' as u32, mods: abi::MOD_CTRL }));
+    });
+}
+
+#[test]
+fn tab_strip_clicks_select_and_close() {
+    big(|| {
+        let mut st = setup();
+        key(&mut st, 't' as u32, abi::MOD_CTRL);
+        go(&mut st, "test.aether/article.html");
+        assert_eq!(st.tab_count(), 2);
+        // The first tab starts at x=8; with two tabs it is 220 px wide.
+        click(&mut st, (100, 20));
+        assert_eq!(st.active_tab(), 0);
+        // Its close button is at the right edge.
+        click(&mut st, (8 + 220 - 15, 20));
+        assert_eq!(st.tab_count(), 1);
+        // The + button opens a tab.
+        click(&mut st, (8 + 220 + 6 + 14, 20));
+        assert_eq!(st.tab_count(), 2);
+        // Drawing a window with tabs is safe.
+        let (w, h) = (1000u32, 700u32);
+        let mut px = vec![0u32; (w * h) as usize];
+        st.draw(&mut px, w, h, w);
+    });
+}
+
+#[test]
+fn new_tab_page_is_blank_and_ready() {
+    big(|| {
+        let mut st = setup();
+        key(&mut st, 't' as u32, abi::MOD_CTRL);
+        assert_eq!(st.tab_title(1), "New Tab");
+        // Typing goes into the address bar of the new tab, not the old page.
+        type_text(&mut st, "test.aether/");
+        key(&mut st, '\n' as u32, 0);
+        assert_eq!(st.address(), "https://test.aether/");
+        key(&mut st, '1' as u32, abi::MOD_CTRL);
+        assert_eq!(st.address(), "");
+    });
+}
+
+#[test]
+fn pictures_render_in_a_page() {
+    big(|| {
+        let mut st = setup();
+        go(&mut st, "test.aether/images.html");
+        assert_eq!(st.image_count(), 7, "{:?}", st.status());
+        assert!(st.page_text().contains("Pictures"));
+        let (w, h) = (1000u32, 700u32);
+        let mut px = vec![0u32; (w * h) as usize];
+        st.draw(&mut px, w, h, w);
+        // The decoded gradient is drawn in colour, not the grey placeholder.
+        assert!(px.iter().any(|&p| (p & 0xFF) > 40 && ((p >> 8) & 0xFF) > 100), "no picture pixels");
+    });
+}
+
+#[test]
 fn scripts_can_be_turned_off_per_site() {
     big(|| {
         let mut st = setup();

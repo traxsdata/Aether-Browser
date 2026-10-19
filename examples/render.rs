@@ -66,7 +66,7 @@ fn main() {
             let mut cache = Cache::default();
             {
                 let mut cv = Canvas::new(&mut px, w, h, w);
-                paint_page(&mut cv, &mut cache, &pg, 0, 0, 0.0, &form);
+                paint_page(&mut cv, &mut cache, &pg, &l.images, 0, 0, 0.0, &form);
             }
             eprintln!("title {:?}, {} items, {}x{} (page {}), layout {:?}, total {:?}", l.title, pg.items.len(), w, h, pg.height, t1, t0.elapsed());
             std::fs::write(&out, aether_host::png::encode_xrgb(&px, w, h, w)).unwrap();

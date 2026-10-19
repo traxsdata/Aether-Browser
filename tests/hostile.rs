@@ -18,8 +18,9 @@ fn render(html: &str) -> f32 {
     let form = page::initial_form(&l.doc);
     {
         let mut cv = Canvas::new(&mut px, 800, 300, 800);
-        paint_page(&mut cv, &mut cache, &pg, 0, 0, 0.0, &form);
-        paint_page(&mut cv, &mut cache, &pg, 0, 0, (pg.height - 150.0).max(0.0), &form);
+        let images = std::collections::HashMap::new();
+        paint_page(&mut cv, &mut cache, &pg, &images, 0, 0, 0.0, &form);
+        paint_page(&mut cv, &mut cache, &pg, &images, 0, 0, (pg.height - 150.0).max(0.0), &form);
     }
     pg.height
 }

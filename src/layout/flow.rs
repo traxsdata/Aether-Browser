@@ -499,21 +499,32 @@ impl Flow {
         let sh = s.height.resolve(None).map(|v| unbox(v, vpad));
         let fs = s.font_size;
         let face = s.face();
-        match r {
-            Replaced::Image { alt, .. } => match (sw, sh) {
-                (Some(w), Some(h)) => (w, h),
-                (Some(w), None) => (w, (w * 0.62).round()),
-                (None, Some(h)) => ((h * 1.6).round(), h),
-                (None, None) => {
-                    if alt.trim().is_empty() {
-                        (0.0, 0.0)
-                    } else {
-                        let f = crate::font::Face::new(fs.min(14.0), false, true, false);
-                        let t = crate::font::normalize(alt.trim());
-                        ((f.width(&t) + 30.0).min(400.0).min(if cw > 0.0 { cw } else { 400.0 }), (fs.min(14.0) * 1.3 + 8.0).round())
+        let (mut w, mut h) = match r {
+            Replaced::Image { alt, .. } => {
+                let intrinsic = b.intrinsic.get();
+                match (sw, sh) {
+                    (Some(w), Some(h)) => (w, h),
+                    (Some(w), None) => {
+                        let h = intrinsic.map(|(iw, ih)| if iw > 0.0 { (w * ih / iw).round() } else { (w * 0.62).round() }).unwrap_or((w * 0.62).round());
+                        (w, h)
+                    }
+                    (None, Some(h)) => {
+                        let w = intrinsic.map(|(iw, ih)| if ih > 0.0 { (h * iw / ih).round() } else { (h * 1.6).round() }).unwrap_or((h * 1.6).round());
+                        (w, h)
+                    }
+                    (None, None) => {
+                        if let Some((w, h)) = intrinsic {
+                            (w, h)
+                        } else if alt.trim().is_empty() {
+                            (0.0, 0.0)
+                        } else {
+                            let f = crate::font::Face::new(fs.min(14.0), false, true, false);
+                            let t = crate::font::normalize(alt.trim());
+                            ((f.width(&t) + 30.0).min(400.0).min(if cw > 0.0 { cw } else { 400.0 }), (fs.min(14.0) * 1.3 + 8.0).round())
+                        }
                     }
                 }
-            },
+            }
             Replaced::Frame { .. } => (sw.unwrap_or(300.0), sh.unwrap_or(150.0)),
             Replaced::Blank => (sw.unwrap_or(0.0), sh.unwrap_or(0.0)),
             Replaced::Field(k) => {
@@ -526,7 +537,34 @@ impl Flow {
                     FieldKind::Select { label } => (sw.unwrap_or(face.width(&crate::font::normalize(label)).ceil() + fs * 1.6), sh.unwrap_or(line)),
                 }
             }
+        };
+        // CSS max/min sizing applies to pictures too. The common responsive
+        // rule is `img { max-width: 100%; height: auto }`; preserve the
+        // aspect ratio when a constraint changes one side.
+        if matches!(r, Replaced::Image { .. }) {
+            if let Some(max) = s.max_width.resolve(base) {
+                if w > max && w > 0.0 {
+                    let scale = max / w;
+                    w = max;
+                    h = (h * scale).round();
+                }
+            }
+            if let Some(max) = s.max_height.resolve(Some(h)) {
+                if h > max && h > 0.0 {
+                    let scale = max / h;
+                    h = max;
+                    w = (w * scale).round();
+                }
+            }
+            if let Some(min) = s.min_width.resolve(base) {
+                if w < min {
+                    let scale = if w > 0.0 { min / w } else { 1.0 };
+                    w = min;
+                    h = (h * scale).round();
+                }
+            }
         }
+        (w, h)
     }
 
     fn replaced(&mut self, b: &LBox, r: &Replaced, cx: f32, cy: f32, cw: f32, spec_h: Option<f32>) -> f32 {
@@ -539,7 +577,7 @@ impl Flow {
         match r {
             Replaced::Image { alt, .. } => {
                 if cw > 0.0 && h > 0.0 {
-                    self.push(Item::Image { x: cx, y: cy, w: cw, h, alt: crate::font::normalize(alt.trim()) });
+                    self.push(Item::Image { x: cx, y: cy, w: cw, h, alt: crate::font::normalize(alt.trim()), node: b.node });
                 }
             }
             Replaced::Frame { src } => {

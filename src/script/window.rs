@@ -558,7 +558,7 @@ fn install_storage(it: &mut Interp) {
 fn install_misc(it: &mut Interp) {
     let nav = it.new_object();
     for (k, v) in [
-        ("userAgent", "Mozilla/5.0 (aether) aether-browser/0.6"),
+        ("userAgent", "Mozilla/5.0 (aether) aether-browser/0.7"),
         ("appName", "Netscape"),
         ("appVersion", "5.0 (aether)"),
         ("appCodeName", "Mozilla"),

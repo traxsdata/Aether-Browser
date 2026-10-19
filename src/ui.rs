@@ -37,7 +37,11 @@ const BAR_TOP: u32 = 0x1A2344;
 const BAR_BOTTOM: u32 = 0x121933;
 const EDGE: u32 = 0x2A3560;
 
+pub const TAB_H: i32 = 36;
 pub const TOOLBAR_H: i32 = 52;
+/// Keeping every tab's page, scripts and fonts in memory is cheap; an
+/// unbounded number of them is not.
+pub const MAX_TABS: usize = 32;
 const LINE_PX: f32 = 40.0;
 const WHEEL_PX: f32 = 54.0;
 
@@ -126,7 +130,8 @@ enum Button {
     Shield,
 }
 
-pub struct State {
+/// One browser tab: its own page, history, scripts and address bar.
+pub struct Tab {
     w: i32,
     h: i32,
     cache: Cache,
@@ -162,6 +167,9 @@ pub struct State {
     last_tick: u64,
     /// Counts pages shown (so code can tell the page changed under it).
     gen: u64,
+    /// A page finished loading in a background tab; its scripts wait until
+    /// the tab is selected, so they can't take over the UI thread unseen.
+    scripts_pending: bool,
 }
 
 fn builtin_shown(name: &str, html: &str, kind: Kind, w: i32, h: i32) -> Shown {
@@ -189,10 +197,10 @@ fn focusables(page: &Page) -> Vec<(Target, f32, f32, f32, f32)> {
     out
 }
 
-impl State {
-    pub fn new(w: i32, h: i32, sync_loads: bool) -> State {
+impl Tab {
+    pub fn new(w: i32, h: i32, sync_loads: bool) -> Tab {
         let shown = builtin_shown("home", &pages::home(), Kind::Normal, w, h);
-        State {
+        Tab {
             w,
             h,
             cache: Cache::default(),
@@ -222,6 +230,7 @@ impl State {
             script_navs: 0,
             last_tick: 0,
             gen: 0,
+            scripts_pending: false,
         }
     }
 
@@ -444,6 +453,7 @@ impl State {
         }
         self.title = shown.loaded.title.clone();
         self.shown = shown;
+        self.scripts_pending = false;
         self.gen += 1;
         self.page_focus = None;
         self.hover_target = None;
@@ -485,7 +495,7 @@ impl State {
         if self.sync_loads {
             // Headless runs are scripted: wait for the page.
             let r = self.loading.as_ref().unwrap().rx.recv();
-            self.finish_load(r.unwrap_or(Err(LoadError::Cancelled)));
+            self.finish_load(r.unwrap_or(Err(LoadError::Cancelled)), true);
         }
     }
 
@@ -494,18 +504,35 @@ impl State {
         let Some(l) = &self.loading else { return self.tick_scripts() };
         match l.rx.try_recv() {
             Ok(r) => {
-                self.finish_load(r);
+                self.finish_load(r, true);
                 true
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => true, // animate the progress bar
             Err(_) => {
-                self.finish_load(Err(LoadError::Cancelled));
+                self.finish_load(Err(LoadError::Cancelled), true);
                 true
             }
         }
     }
 
-    fn finish_load(&mut self, r: Result<(Loaded, Page), LoadError>) {
+    /// A tab that isn't on screen still finishes loading, but its timers wait
+    /// until it is selected (background tabs are throttled, not forgotten).
+    pub fn poll_background(&mut self) -> bool {
+        let Some(l) = &self.loading else { return false };
+        match l.rx.try_recv() {
+            Ok(r) => {
+                self.finish_load(r, false);
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(_) => {
+                self.finish_load(Err(LoadError::Cancelled), false);
+                true
+            }
+        }
+    }
+
+    fn finish_load(&mut self, r: Result<(Loaded, Page), LoadError>, run_scripts: bool) {
         let Some(l) = self.loading.take() else { return };
         self.status.clear();
         match r {
@@ -526,16 +553,20 @@ impl State {
                     }
                 }
                 if !loaded.blocked.is_empty() {
-                    self.status = format!("{} stylesheet(s) not loaded", loaded.blocked.len());
+                    self.status = format!("{} page resource(s) not loaded", loaded.blocked.len());
                 }
                 let frag = loaded.fragment.clone();
                 let shown = make_shown(loaded, pg, Kind::Normal);
                 self.commit(nav, shown, l.push);
                 let before = self.page_id();
-                self.start_scripts();
-                if self.loading.is_some() || before != self.page_id() {
-                    // A script sent the page somewhere else.
-                    return;
+                if run_scripts {
+                    self.start_scripts();
+                    if self.loading.is_some() || before != self.page_id() {
+                        // A script sent the page somewhere else.
+                        return;
+                    }
+                } else {
+                    self.scripts_pending = true;
                 }
                 if let Some(f) = frag {
                     self.jump_to_fragment(&f);
@@ -613,8 +644,17 @@ impl State {
         self.gen
     }
 
+    /// Runs scripts that were deferred while the tab was in the background.
+    pub fn start_pending_scripts(&mut self) {
+        if self.scripts_pending && self.loading.is_none() {
+            self.scripts_pending = false;
+            self.start_scripts();
+        }
+    }
+
     /// Starts the page's scripts (if its site runs any).
     fn start_scripts(&mut self) {
+        self.scripts_pending = false;
         let Location::Web(url) = self.shown.loaded.location.clone() else { return };
         if !self.shown.loaded.script_mode.runs() || self.shown.kind != Kind::Normal {
             return;
@@ -1417,7 +1457,7 @@ impl State {
         // The page.
         cv.clip = Rect::new(0, TOOLBAR_H, w, h - TOOLBAR_H);
         self.shown.form.caret_on = self.caret_on;
-        paint_page(&mut cv, &mut self.cache, &self.shown.page, 0, TOOLBAR_H, self.shown.scroll, &self.shown.form);
+        paint_page(&mut cv, &mut self.cache, &self.shown.page, &self.shown.loaded.images, 0, TOOLBAR_H, self.shown.scroll, &self.shown.form);
         // Keyboard focus ring.
         if let Some(t) = self.page_focus {
             let accent = c(0x6D3BE8);
@@ -1703,6 +1743,565 @@ impl State {
         self.shown.loaded.secure && matches!(self.shown.kind, Kind::Normal)
     }
 }
+
+/// The browser window: a strip of tabs and the selected tab's toolbar and
+/// page. Each tab keeps its own history, scripts and http choices.
+pub struct State {
+    w: i32,
+    h: i32,
+    tabs: Vec<Tab>,
+    active: usize,
+    sync_loads: bool,
+    fetcher: Fetcher<'static>,
+    now: u64,
+    /// What pages store (localStorage, sessionStorage, script cookies) lives
+    /// here for the whole window, in memory. Tabs share the same origin-keyed
+    /// jar, as they would in a browser.
+    storage: Rc<RefCell<script::Storage>>,
+    /// The selected tab is drawn here, then copied below the tab strip.
+    scratch: Vec<u32>,
+    /// A font cache for the tab strip (pages have their own).
+    chrome_cache: Cache,
+    mouse: (i32, i32),
+    hover_tab: Option<usize>,
+    hover_close: Option<usize>,
+    hover_new: bool,
+    quiet: bool,
+}
+
+impl State {
+    pub fn new(w: i32, h: i32, sync_loads: bool) -> State {
+        let tab_h = (h - TAB_H).max(1);
+        let storage = Rc::new(RefCell::new(script::Storage::default()));
+        let mut tab = Tab::new(w, tab_h, sync_loads);
+        tab.storage = storage.clone();
+        State {
+            w,
+            h,
+            tabs: vec![tab],
+            active: 0,
+            sync_loads,
+            fetcher: page::default_fetcher(),
+            now: 0,
+            storage,
+            scratch: Vec::new(),
+            chrome_cache: Cache::default(),
+            mouse: (-1, -1),
+            hover_tab: None,
+            hover_close: None,
+            hover_new: false,
+            quiet: false,
+        }
+    }
+
+    pub fn set_fetcher(&mut self, f: Fetcher<'static>) {
+        self.fetcher = f;
+        for t in &mut self.tabs {
+            t.set_fetcher(f);
+        }
+    }
+
+    fn tab(&self) -> &Tab {
+        &self.tabs[self.active]
+    }
+
+    fn tab_mut(&mut self) -> &mut Tab {
+        &mut self.tabs[self.active]
+    }
+
+    fn tab_h(&self) -> i32 {
+        (self.h - TAB_H).max(1)
+    }
+
+    // ---- tabs -------------------------------------------------------------
+
+    pub fn tab_count(&self) -> usize {
+        self.tabs.len()
+    }
+
+    pub fn active_tab(&self) -> usize {
+        self.active
+    }
+
+    pub fn tab_title(&self, i: usize) -> String {
+        let Some(t) = self.tabs.get(i) else { return String::new() };
+        let short: String = t.title.chars().take(512).collect();
+        let title = short.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !title.is_empty() && title != "New page" {
+            title
+        } else if matches!(t.shown.loaded.location, Location::About(ref n) if n == "home") {
+            "New Tab".into()
+        } else {
+            let a = t.address_text();
+            if a.is_empty() { "New Tab".into() } else { a }
+        }
+    }
+
+    pub fn new_tab(&mut self) -> usize {
+        if self.tabs.len() >= MAX_TABS {
+            self.tab_mut().status = "Too many tabs; close one first.".into();
+            return self.active;
+        }
+        let mut t = Tab::new(self.w, self.tab_h(), self.sync_loads);
+        t.set_fetcher(self.fetcher);
+        t.storage = self.storage.clone();
+        t.tick(self.now);
+        t.focus_address();
+        let at = (self.active + 1).min(self.tabs.len());
+        self.tabs.insert(at, t);
+        self.active = at;
+        self.hover_tab = None;
+        self.hover_close = None;
+        at
+    }
+
+    /// Selects tab `i`; returns false if there is no such tab.
+    pub fn select_tab(&mut self, i: usize) -> bool {
+        if i >= self.tabs.len() {
+            return false;
+        }
+        self.active = i;
+        self.tabs[i].tick(self.now);
+        self.tabs[i].start_pending_scripts();
+        self.tabs[i].quiet = false;
+        true
+    }
+
+    /// Closes tab `i`; true if the window should stay open. Closing the last
+    /// tab closes the window, as in Chrome.
+    pub fn close_tab(&mut self, i: usize) -> bool {
+        if i >= self.tabs.len() {
+            return true;
+        }
+        if self.tabs.len() == 1 {
+            return false;
+        }
+        self.tabs[i].stop();
+        self.tabs.remove(i);
+        if i < self.active {
+            self.active -= 1;
+        } else if self.active >= self.tabs.len() {
+            self.active = self.tabs.len() - 1;
+        }
+        self.tabs[self.active].tick(self.now);
+        self.hover_tab = None;
+        self.hover_close = None;
+        true
+    }
+
+    fn next_tab(&mut self, back: bool) {
+        let n = self.tabs.len();
+        if n < 2 {
+            return;
+        }
+        let i = if back { (self.active + n - 1) % n } else { (self.active + 1) % n };
+        self.select_tab(i);
+    }
+
+    fn tab_rects(&self) -> Vec<(usize, Rect)> {
+        let n = self.tabs.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let room = (self.w - 8 - 40).max(40);
+        let gap = 2;
+        let mut w = ((room - gap * (n as i32 - 1)) / n as i32).clamp(24, 220);
+        if w * n as i32 + gap * (n as i32 - 1) > room {
+            w = ((room - gap * (n as i32 - 1)) / n as i32).max(16);
+        }
+        let mut x = 8;
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            out.push((i, Rect::new(x, 4, w, TAB_H - 4)));
+            x += w + gap;
+        }
+        out
+    }
+
+    fn close_rect(&self, tab: Rect) -> Rect {
+        Rect::new(tab.x + tab.w - 24, tab.y + 7, 18, 20)
+    }
+
+    fn new_tab_rect(&self) -> Rect {
+        let rects = self.tab_rects();
+        let x = rects.last().map_or(8, |(_, r)| r.x + r.w + 6);
+        Rect::new(x, 4, 28, TAB_H - 4)
+    }
+
+    fn update_tab_hover(&mut self, x: i32, y: i32) {
+        let mut tab = None;
+        let mut close = None;
+        for (i, r) in self.tab_rects() {
+            if r.contains(x, y) {
+                tab = Some(i);
+                if r.w >= 88 && self.close_rect(r).contains(x, y) {
+                    close = Some(i);
+                }
+            }
+        }
+        self.hover_tab = tab;
+        self.hover_close = close;
+        self.hover_new = self.new_tab_rect().contains(x, y);
+    }
+
+    fn tab_click(&mut self, x: i32, y: i32) -> bool {
+        if self.new_tab_rect().contains(x, y) {
+            self.new_tab();
+            return true;
+        }
+        for (i, r) in self.tab_rects() {
+            if r.contains(x, y) {
+                if r.w >= 88 && self.close_rect(r).contains(x, y) {
+                    return self.close_tab(i);
+                }
+                self.select_tab(i);
+                return true;
+            }
+        }
+        true
+    }
+
+    // ---- navigation ------------------------------------------------------
+
+    pub fn open_typed(&mut self, text: &str) {
+        self.tab_mut().open_typed(text);
+    }
+
+    pub fn back(&mut self) {
+        self.tab_mut().back();
+    }
+
+    pub fn forward(&mut self) {
+        self.tab_mut().forward();
+    }
+
+    pub fn reload(&mut self) {
+        self.tab_mut().reload();
+    }
+
+    pub fn stop(&mut self) {
+        self.tab_mut().stop();
+    }
+
+    pub fn is_loading(&self) -> bool {
+        self.tab().is_loading()
+    }
+
+    // ---- scripts, polling and time --------------------------------------
+
+    pub fn poll(&mut self) -> bool {
+        let mut changed = false;
+        for i in 0..self.tabs.len() {
+            if i == self.active {
+                changed |= self.tabs[i].poll();
+            } else {
+                changed |= self.tabs[i].poll_background();
+            }
+        }
+        changed
+    }
+
+    pub fn script_wake(&self) -> Option<u32> {
+        self.tab().script_wake()
+    }
+
+    pub fn script_errors(&self) -> Vec<String> {
+        self.tab().script_errors()
+    }
+
+    pub fn toggle_scripts_for_test(&mut self) {
+        self.tab_mut().toggle_scripts_for_test();
+    }
+
+    pub fn tick(&mut self, now: u64) {
+        self.now = now;
+        for t in &mut self.tabs {
+            t.tick(now);
+        }
+    }
+
+    pub fn wants_caret(&self) -> bool {
+        self.tab().wants_caret()
+    }
+
+    pub fn blink(&mut self) {
+        self.tab_mut().blink();
+    }
+
+    // ---- input -----------------------------------------------------------
+
+    pub fn handle(&mut self, ev: Event) -> bool {
+        self.quiet = false;
+        match ev {
+            Event::Close => return false,
+            Event::Resize { width, height } => {
+                self.resize(width as i32, height as i32);
+                return true;
+            }
+            Event::Key { key, mods } => {
+                let ctrl = mods & abi::MOD_CTRL != 0;
+                if ctrl && (key == 'w' as u32 || key == 'W' as u32 || key == 23) {
+                    // Closing the last tab closes the window, as in Chrome.
+                    return self.close_tab(self.active);
+                }
+                if self.tab_shortcut(key, mods) {
+                    return true;
+                }
+                let keep = self.tab_mut().handle(Event::Key { key, mods });
+                self.quiet = self.tab().quiet;
+                return keep;
+            }
+            Event::MouseMove(m) => {
+                self.mouse = (m.x, m.y);
+                if m.y < TAB_H {
+                    let before = (self.hover_tab, self.hover_close, self.hover_new);
+                    self.update_tab_hover(m.x, m.y);
+                    self.quiet = before == (self.hover_tab, self.hover_close, self.hover_new);
+                    return true;
+                }
+                let mut m = m;
+                m.y -= TAB_H;
+                let keep = self.tab_mut().handle(Event::MouseMove(m));
+                self.quiet = self.tab().quiet;
+                return keep;
+            }
+            Event::MouseDown(m) => {
+                self.mouse = (m.x, m.y);
+                if m.y < TAB_H {
+                    self.update_tab_hover(m.x, m.y);
+                    if m.buttons & 1 != 0 {
+                        return self.tab_click(m.x, m.y);
+                    }
+                    if m.buttons & 4 != 0 {
+                        // Middle-click closes the tab under the pointer.
+                        if let Some((i, _)) = self.tab_rects().into_iter().find(|(_, r)| r.contains(m.x, m.y)) {
+                            return self.close_tab(i);
+                        }
+                    }
+                    return true;
+                }
+                let mut m = m;
+                m.y -= TAB_H;
+                let keep = self.tab_mut().handle(Event::MouseDown(m));
+                self.quiet = self.tab().quiet;
+                return keep;
+            }
+            Event::MouseUp(m) => {
+                self.mouse = (m.x, m.y);
+                let mut m = m;
+                m.y -= TAB_H;
+                let keep = self.tab_mut().handle(Event::MouseUp(m));
+                self.quiet = self.tab().quiet;
+                return keep;
+            }
+            Event::Scroll { dx, dy, mods } => {
+                if self.mouse.1 >= 0 && self.mouse.1 < TAB_H {
+                    return true;
+                }
+                let keep = self.tab_mut().handle(Event::Scroll { dx, dy, mods });
+                self.quiet = self.tab().quiet;
+                return keep;
+            }
+            Event::Focus | Event::Unfocus => {
+                let keep = self.tab_mut().handle(ev);
+                self.quiet = self.tab().quiet;
+                return keep;
+            }
+        }
+    }
+
+    /// Window-level shortcuts (tabs) run before the page's own keys.
+    fn tab_shortcut(&mut self, key: u32, mods: u32) -> bool {
+        let ctrl = mods & abi::MOD_CTRL != 0;
+        let shift = mods & abi::MOD_SHIFT != 0;
+        if !ctrl {
+            return false;
+        }
+        if key == 't' as u32 || key == 'T' as u32 || key == 20 {
+            self.new_tab();
+            return true;
+        }
+        if key == '\t' as u32 {
+            self.next_tab(shift);
+            return true;
+        }
+        if (b'1' as u32..=b'9' as u32).contains(&key) {
+            let n = self.tabs.len();
+            let i = if key == b'9' as u32 { n - 1 } else { (key - b'1' as u32) as usize };
+            self.select_tab(i);
+            return true;
+        }
+        false
+    }
+
+    pub fn resize(&mut self, w: i32, h: i32) {
+        if w == self.w && h == self.h {
+            return;
+        }
+        self.w = w;
+        self.h = h;
+        let th = self.tab_h();
+        for t in &mut self.tabs {
+            t.resize(w, th);
+        }
+    }
+
+    // ---- drawing ---------------------------------------------------------
+
+    pub fn draw(&mut self, px: &mut [u32], w: u32, h: u32, pitch: u32) {
+        let (wi, hi) = (w as i32, h as i32);
+        let th = (hi - TAB_H).max(0);
+        if th > 0 {
+            let need = w as usize * th as usize;
+            if self.scratch.len() < need {
+                self.scratch.resize(need, 0);
+            }
+            {
+                let tab = &mut self.tabs[self.active];
+                tab.draw(&mut self.scratch[..need], w, th as u32, w);
+            }
+            for row in 0..th as usize {
+                let src = &self.scratch[row * w as usize..(row + 1) * w as usize];
+                let start = (row + TAB_H as usize) * pitch as usize;
+                let dst = &mut px[start..start + w as usize];
+                dst.copy_from_slice(src);
+            }
+        }
+        let mut cv = Canvas::new(px, w, h, pitch);
+        cv.clip = Rect::new(0, 0, wi, TAB_H.min(hi).max(0));
+        self.draw_tabs(&mut cv, wi);
+    }
+
+    fn draw_tabs(&mut self, cv: &mut Canvas, w: i32) {
+        cv.fill(Rect::new(0, 0, w, TAB_H), c(0x0B1020));
+        cv.fill(Rect::new(0, TAB_H - 1, w, 1), c(EDGE));
+        let rects = self.tab_rects();
+        for (i, r) in &rects {
+            let active = *i == self.active;
+            let hot = self.hover_tab == Some(*i);
+            let bg = if active { c(0x1A2344) } else if hot { c(0x151B33) } else { c(0x10162A) };
+            let old = cv.push_clip(Rect::new(0, 0, w, TAB_H));
+            cv.round_rect(r.x as f32, r.y as f32, r.w as f32, (r.h + 12) as f32, 10.0, bg);
+            cv.clip = old;
+            if active {
+                cv.fill(Rect::new(r.x + 10, r.y, r.w - 20, 2), c(ACCENT));
+            }
+            // Favicon: a small page mark, a lock for https, or a spinner.
+            let (ix, iy) = (r.x + 10, r.y + 11);
+            let loading = self.tabs[*i].loading.is_some();
+            if loading {
+                let t = self.now.wrapping_sub(self.tabs[*i].loading.as_ref().map_or(0, |l| l.started)) as f32 / 140.0;
+                let pts: Vec<(f32, f32)> = (0..=10)
+                    .map(|k| {
+                        let a = t + k as f32 / 10.0 * 4.2;
+                        (ix as f32 + 7.0 + 5.0 * a.cos(), iy as f32 + 7.0 + 5.0 * a.sin())
+                    })
+                    .collect();
+                cv.stroke(&pts, 1.8, c(ACCENT));
+            } else {
+                let secure = self.tabs[*i].is_secure();
+                let col = if secure { c(SAFE) } else { c(0x4A5578) };
+                cv.round_rect(ix as f32, iy as f32, 14.0, 14.0, 4.0, col);
+                if secure {
+                    // A tiny closed padlock.
+                    cv.fill(Rect::new(ix + 4, iy + 7, 6, 5), c(0x0B1020));
+                    cv.stroke(&[(ix as f32 + 5.0, iy as f32 + 7.0), (ix as f32 + 5.0, iy as f32 + 4.5), (ix as f32 + 7.0, iy as f32 + 3.0), (ix as f32 + 9.0, iy as f32 + 4.5), (ix as f32 + 9.0, iy as f32 + 7.0)], 1.2, c(0x0B1020));
+                } else {
+                    let f = Face::new(9.0, true, false, false);
+                    let ch = self.tab_title(*i).chars().next().unwrap_or('?');
+                    let s = ch.to_string();
+                    let tw = f.width(&s);
+                    cv.text(&mut self.chrome_cache, ix as f32 + (14.0 - tw) / 2.0, iy as f32 + 11.0, &s, f, c(TEXT), 0.0);
+                }
+            }
+            // Title.
+            let face = Face::new(12.5, false, false, false);
+            let title = ellipsize_text(&self.tab_title(*i), face, (r.w - 52).max(0) as f32);
+            cv.text(&mut self.chrome_cache, (r.x + 30) as f32, (r.y + 22) as f32, &title, face, if active { c(TEXT) } else { c(TEXT_DIM) }, 0.0);
+            // Close button on the active or hovered tab.
+            if r.w >= 88 && (active || hot) {
+                let cr = self.close_rect(*r);
+                if self.hover_close == Some(*i) {
+                    cv.round_rect(cr.x as f32, cr.y as f32, cr.w as f32, cr.h as f32, 7.0, c(0x2A3356));
+                }
+                let (cx, cy) = (cr.x as f32 + 9.0, cr.y as f32 + 10.0);
+                cv.stroke(&[(cx - 3.5, cy - 3.5), (cx + 3.5, cy + 3.5)], 1.5, c(TEXT_DIM));
+                cv.stroke(&[(cx + 3.5, cy - 3.5), (cx - 3.5, cy + 3.5)], 1.5, c(TEXT_DIM));
+            }
+        }
+        // New tab button.
+        let nr = self.new_tab_rect();
+        if self.hover_new {
+            cv.round_rect(nr.x as f32, nr.y as f32, nr.w as f32, nr.h as f32, 8.0, c(0x1A2344));
+        }
+        let (cx, cy) = (nr.x as f32 + nr.w as f32 / 2.0, nr.y as f32 + nr.h as f32 / 2.0);
+        cv.stroke(&[(cx - 5.0, cy), (cx + 5.0, cy)], 1.8, c(TEXT_DIM));
+        cv.stroke(&[(cx, cy - 5.0), (cx, cy + 5.0)], 1.8, c(TEXT_DIM));
+    }
+
+    // ---- for tests -------------------------------------------------------
+
+    pub fn address(&self) -> String {
+        self.tab().address()
+    }
+
+    pub fn find_link(&mut self, needle: &str) -> Option<(i32, i32)> {
+        self.tab_mut().find_link(needle).map(|(x, y)| (x, y + TAB_H))
+    }
+
+    pub fn find_text(&mut self, needle: &str) -> Option<(i32, i32)> {
+        self.tab_mut().find_text(needle).map(|(x, y)| (x, y + TAB_H))
+    }
+
+    pub fn page_text(&self) -> String {
+        self.tab().page_text()
+    }
+
+    pub fn scroll(&self) -> f32 {
+        self.tab().scroll()
+    }
+
+    pub fn status(&self) -> &str {
+        self.tab().status()
+    }
+
+    pub fn is_interstitial(&self) -> bool {
+        self.tab().is_interstitial()
+    }
+
+    pub fn is_secure(&self) -> bool {
+        self.tab().is_secure()
+    }
+
+    /// How many pictures the current page decoded (for tests).
+    pub fn image_count(&self) -> usize {
+        self.tab().shown.loaded.images.len()
+    }
+
+    pub fn window_title(&self) -> String {
+        self.tab().window_title().chars().take(512).collect()
+    }
+}
+
+/// Cuts `s` to fit in `max` pixels, with an ellipsis when it doesn't.
+fn ellipsize_text(s: &str, face: Face, max: f32) -> String {
+    if face.width(s) <= max {
+        return s.to_string();
+    }
+    let dots = "...";
+    let mut out = String::new();
+    for ch in s.chars() {
+        let mut next = out.clone();
+        next.push(ch);
+        if face.width(&next) + face.width(dots) > max {
+            break;
+        }
+        out = next;
+    }
+    out.push_str(dots);
+    out
+}
+
 
 /// The scripts button's description of a mode.
 fn scripts_label(m: Mode, errors: usize) -> &'static str {

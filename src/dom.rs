@@ -160,6 +160,7 @@ impl Document {
     /// The page's <title>, with white space collapsed.
     pub fn title(&self) -> String {
         let t = self.find("title").map(|t| self.text_content(t)).unwrap_or_default();
+        let t: String = t.chars().take(1024).collect();
         t.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 

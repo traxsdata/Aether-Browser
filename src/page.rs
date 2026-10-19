@@ -5,12 +5,15 @@
 //! runs on this thread: the window runs them once the page is in (see
 //! script::Runtime).
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use crate::css::{compute_styles, MediaEnv, Stylesheet};
 use crate::dom::{Document, NodeData, NodeId};
 use crate::html::{self, Charset};
-use crate::layout::{build_tree, layout_document, Page};
+use crate::image::{self, Image};
+use crate::layout::{apply_image_sizes, build_tree, layout_document, Page};
 use crate::net::{self, FetchError, Method, Request, Response, Url};
 use crate::paint::FormState;
 use crate::script::{Mode, PageScript, Policy, Source};
@@ -24,6 +27,10 @@ pub const MAX_INLINE_CSS: usize = 4 << 20;
 pub const MAX_SCRIPTS: usize = 200;
 pub const MAX_SCRIPT_BYTES: usize = 4 << 20;
 pub const MAX_ALL_SCRIPT_BYTES: usize = 24 << 20;
+pub const MAX_IMAGES: usize = 96;
+pub const MAX_IMAGE_BYTES: usize = 8 << 20;
+pub const MAX_ALL_IMAGE_BYTES: usize = 32 << 20;
+pub const MAX_ALL_IMAGE_PIXELS: u64 = 32 * 1024 * 1024;
 
 /// Where a page came from.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -79,6 +86,8 @@ pub struct Loaded {
     pub fragment: Option<String>,
     /// Subresources that were refused or failed (for the status line).
     pub blocked: Vec<String>,
+    /// Decoded pictures, keyed by their `<img>` node.
+    pub images: HashMap<NodeId, Arc<Image>>,
     pub allow_http: bool,
     /// What scripts this page may run, and the ones it has, in run order.
     pub script_mode: Mode,
@@ -119,6 +128,7 @@ pub fn load(req: Request, fragment: Option<String>, fetch: Fetcher, cancel: &Ato
     loaded.secure &= resp.secure;
     let html = matches!(mime.as_str(), "text/html" | "application/xhtml+xml" | "");
     if html {
+        gather_images(&mut loaded, fetch, cancel)?;
         loaded.script_mode = policy.mode_for(&resp.url);
         if loaded.script_mode.runs() {
             gather_scripts(&mut loaded, fetch, cancel)?;
@@ -186,6 +196,7 @@ fn finish(
         base,
         fragment,
         blocked: Vec::new(),
+        images: HashMap::new(),
         allow_http,
         script_mode: Mode::Off,
         scripts: Vec::new(),
@@ -252,9 +263,215 @@ fn gather_styles(l: &mut Loaded, fetch: Option<Fetcher>, cancel: &AtomicBool) ->
     Ok(())
 }
 
-/// The page's scripts: inline ones as they are, external ones fetched (a
-/// few at a time), in the order they run: parser-blocking scripts in
-/// document order, then async and defer ones.
+/// The page's pictures: `<img src>` (or the largest `srcset` candidate),
+/// fetched over https and decoded with the browser's own decoders. Data URLs
+/// are decoded without touching the network. Limits keep a hostile gallery
+/// from turning into a memory problem; a picture that fails is left as its
+/// alt-text placeholder.
+fn gather_images(l: &mut Loaded, fetch: Fetcher, cancel: &AtomicBool) -> Result<(), LoadError> {
+    let (Some(base), Location::Web(page)) = (l.base.clone(), l.location.clone()) else { return Ok(()) };
+    let mut wanted: Vec<(NodeId, Url)> = Vec::new();
+    let mut inline: Vec<(NodeId, Vec<u8>, String)> = Vec::new();
+    for n in l.doc.find_all("img") {
+        if wanted.len() + inline.len() >= MAX_IMAGES {
+            l.blocked.push("too many pictures; the rest were not loaded".into());
+            break;
+        }
+        let Some(e) = l.doc.element(n) else { continue };
+        if e.foreign {
+            continue;
+        }
+        let src = e
+            .attr("src")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| first_srcset(e.attr("srcset")));
+        let Some(src) = src else { continue };
+        if let Some((bytes, mime)) = data_url(&src) {
+            inline.push((n, bytes, mime));
+            continue;
+        }
+        let Ok(u) = base.join(&src) else {
+            l.blocked.push(format!("{src}: bad picture address"));
+            continue;
+        };
+        if u.scheme() != "http" && u.scheme() != "https" {
+            l.blocked.push(format!("{}: pictures load only over http(s)", u.as_str()));
+            continue;
+        }
+        if u.scheme() == "http" && page.scheme() == "https" {
+            l.blocked.push(format!("{}: a secure page can't load a plain-http picture", u.as_str()));
+            continue;
+        }
+        wanted.push((n, u));
+    }
+    let mut total_bytes = 0usize;
+    let mut total_pixels = 0u64;
+    'batches: for batch in wanted.chunks(4) {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(LoadError::Cancelled);
+        }
+        if total_bytes >= MAX_ALL_IMAGE_BYTES {
+            l.blocked.push("the page's pictures are too big; the rest were not loaded".into());
+            break;
+        }
+        let results: Vec<Result<Response, FetchError>> = std::thread::scope(|sc| {
+            let handles: Vec<_> = batch
+                .iter()
+                .map(|(_, u)| {
+                    let mut req = Request::get(u.clone());
+                    req.max_bytes = MAX_IMAGE_BYTES;
+                    req.allow_http = l.allow_http && u.scheme() == "http";
+                    std::thread::Builder::new().stack_size(2 << 20).spawn_scoped(sc, move || fetch(&req))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| match h {
+                    Ok(h) => h.join().unwrap_or(Err(FetchError::Timeout)),
+                    Err(_) => Err(FetchError::Timeout),
+                })
+                .collect()
+        });
+        for ((n, u), r) in batch.iter().zip(results) {
+            let img = match r {
+                Ok(r) if (200..300).contains(&r.status) => {
+                    if !r.secure {
+                        l.secure = false;
+                    }
+                    total_bytes += r.body.len();
+                    if total_bytes > MAX_ALL_IMAGE_BYTES {
+                        l.blocked.push("the page's pictures are too big; the rest were not loaded".into());
+                        break 'batches;
+                    }
+                    let mime = r.content_type().map(str::to_string);
+                    match image::decode(&r.body, mime.as_deref()) {
+                        Ok(img) => img,
+                        Err(e) => {
+                            l.blocked.push(format!("{}: {e}", u.as_str()));
+                            continue;
+                        }
+                    }
+                }
+                Ok(r) => {
+                    l.blocked.push(format!("{}: HTTP {}", u.as_str(), r.status));
+                    continue;
+                }
+                Err(e) => {
+                    l.blocked.push(format!("{}: {e}", u.as_str()));
+                    continue;
+                }
+            };
+            let px = img.width as u64 * img.height as u64;
+            if total_pixels + px > MAX_ALL_IMAGE_PIXELS {
+                l.blocked.push("the page's pictures are too big; the rest were not loaded".into());
+                break 'batches;
+            }
+            total_pixels += px;
+            l.images.insert(*n, Arc::new(img));
+        }
+    }
+    for (n, bytes, mime) in inline {
+        if let Ok(img) = image::decode(&bytes, Some(&mime)) {
+            let px = img.width as u64 * img.height as u64;
+            if total_pixels + px > MAX_ALL_IMAGE_PIXELS {
+                l.blocked.push("the page's pictures are too big; the rest were not loaded".into());
+                break;
+            }
+            total_pixels += px;
+            l.images.insert(n, Arc::new(img));
+        }
+    }
+    Ok(())
+}
+
+/// The largest candidate in a `srcset`, as a URL.
+fn first_srcset(s: Option<&str>) -> Option<String> {
+    let mut best: Option<(u32, String)> = None;
+    for part in s?.split(',') {
+        let mut words = part.split_whitespace();
+        let url = words.next()?;
+        let desc = words.next().unwrap_or("1x");
+        let score = if let Some(w) = desc.strip_suffix('w') {
+            w.parse::<u32>().unwrap_or(0)
+        } else if let Some(x) = desc.strip_suffix('x') {
+            (x.parse::<f32>().unwrap_or(1.0) * 1000.0) as u32
+        } else {
+            0
+        };
+        if best.as_ref().is_none_or(|(b, _)| score > *b) {
+            best = Some((score, url.to_string()));
+        }
+    }
+    best.map(|(_, u)| u)
+}
+
+/// A `data:` URL: base64 or percent-encoded bytes, never more than one image.
+fn data_url(s: &str) -> Option<(Vec<u8>, String)> {
+    let rest = s.strip_prefix("data:")?;
+    let (meta, payload) = rest.split_once(',')?;
+    let mut mime = meta.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    if mime.is_empty() {
+        mime = "application/octet-stream".into();
+    }
+    let base64 = meta.split(';').any(|p| p.eq_ignore_ascii_case("base64"));
+    let bytes = if base64 { base64_decode(payload)? } else { percent_bytes(payload) };
+    if bytes.len() > MAX_IMAGE_BYTES {
+        return None;
+    }
+    Some((bytes, mime))
+}
+
+fn percent_bytes(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or(""), 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
+}
+
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u8> {
+        Some(match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        })
+    }
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    let mut acc = 0u32;
+    let mut n = 0u32;
+    for &c in s.as_bytes() {
+        if c.is_ascii_whitespace() || c == b'=' {
+            continue;
+        }
+        let v = val(c)? as u32;
+        acc = (acc << 6) | v;
+        n += 6;
+        if n >= 8 {
+            n -= 8;
+            out.push((acc >> n) as u8);
+            acc &= (1 << n) - 1;
+        }
+    }
+    Some(out)
+}
+
+
 fn gather_scripts(l: &mut Loaded, fetch: Fetcher, cancel: &AtomicBool) -> Result<(), LoadError> {
     let (Some(base), Location::Web(page)) = (l.base.clone(), l.location.clone()) else { return Ok(()) };
     let mut first: Vec<PageScript> = Vec::new();
@@ -413,6 +630,8 @@ pub fn lay_out(l: &Loaded, width: f32, height: f32) -> Page {
     // to the window size (the browser's window is fixed-size on æther).
     let styles = compute_styles(&l.doc, &l.sheets, &env);
     let out = build_tree(&l.doc, &styles);
+    let sizes: HashMap<NodeId, (u32, u32)> = l.images.iter().map(|(&n, i)| (n, (i.width, i.height))).collect();
+    apply_image_sizes(&out.root, &sizes);
     layout_document(out, width, height)
 }
 

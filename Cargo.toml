@@ -1,9 +1,9 @@
 [package]
 name = "browser"
-version = "0.5.0"
+version = "0.7.0"
 edition = "2021"
 publish = false
-description = "æther's web browser: a from-scratch HTML/CSS engine and script engine"
+description = "æther's web browser: a from-scratch HTML/CSS engine, picture decoders, script engine and tabbed shell"
 
 [dependencies]
 aether-host = { path = "../aether-host" }

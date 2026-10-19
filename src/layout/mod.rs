@@ -14,6 +14,7 @@ pub mod flow;
 pub mod inline;
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::css::style::{BorderStyle, Style};
@@ -23,6 +24,39 @@ use crate::font::Face;
 
 pub use build::{build_tree, BuildOutput};
 pub use flow::layout_document;
+
+/// Gives replaced boxes their picture's intrinsic size before layout.
+/// `sizes` maps an `<img>` node to its decoded width and height.
+pub fn apply_image_sizes(root: &LBox, sizes: &HashMap<NodeId, (u32, u32)>) {
+    fn walk(b: &LBox, sizes: &HashMap<NodeId, (u32, u32)>) {
+        if let Kind::Replaced(Replaced::Image { .. }) = &b.kind {
+            if let Some(n) = b.node {
+                if let Some(&(w, h)) = sizes.get(&n) {
+                    b.intrinsic.set(Some((w as f32, h as f32)));
+                }
+            }
+        }
+        for c in &b.children {
+            walk(c, sizes);
+        }
+        for i in &b.inlines {
+            if let Inl::Atomic(c, _) = i {
+                walk(c, sizes);
+            }
+        }
+        if let Kind::Table(t) = &b.kind {
+            if let Some(c) = &t.caption {
+                walk(c, sizes);
+            }
+            for row in &t.rows {
+                for cell in &row.cells {
+                    walk(&cell.b, sizes);
+                }
+            }
+        }
+    }
+    walk(root, sizes);
+}
 
 /// Style of a run of text, flattened from its inline ancestors.
 #[derive(Clone, Debug, PartialEq)]
@@ -156,7 +190,7 @@ pub enum Item {
     Rect { x: f32, y: f32, w: f32, h: f32, color: Color, radius: f32 },
     Text { x: f32, y: f32, text: String, face: Face, color: Color, deco: u8, deco_color: Color, letter_spacing: f32 },
     Bullet { x: f32, y: f32, size: f32, kind: u8, color: Color },
-    Image { x: f32, y: f32, w: f32, h: f32, alt: String },
+    Image { x: f32, y: f32, w: f32, h: f32, alt: String, node: Option<NodeId> },
     /// A form field whose current value the painter looks up.
     Field { x: f32, y: f32, w: f32, h: f32, node: NodeId, kind: FieldKind, face: Face, color: Color },
     ClipPush { x: f32, y: f32, w: f32, h: f32 },

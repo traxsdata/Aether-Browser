@@ -3,11 +3,13 @@
 //! display list.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::css::style::{BorderStyle, DECO_LINE_THROUGH, DECO_OVERLINE, DECO_UNDERLINE};
 use crate::css::Color;
 use crate::dom::NodeId;
 use crate::font::{Cache, Face};
+use crate::image::Image;
 use crate::layout::{FieldKind, Item, Page};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -198,6 +200,36 @@ impl<'a> Canvas<'a> {
         self.fill(Rect::new(x0, y, x1 - x0, 1), c);
     }
 
+    /// Draws a decoded RGBA image, scaled to fill (x, y, w, h).
+    pub fn image(&mut self, x: f32, y: f32, w: f32, h: f32, img: &Image) {
+        if w <= 0.0 || h <= 0.0 || img.width == 0 || img.height == 0 {
+            return;
+        }
+        let x0 = x.floor() as i32;
+        let y0 = y.floor() as i32;
+        let dw = (x + w).ceil() as i32 - x0;
+        let dh = (y + h).ceil() as i32 - y0;
+        if dw <= 0 || dh <= 0 {
+            return;
+        }
+        let area = Rect::new(x0, y0, dw, dh).intersect(&self.clip);
+        let iw = img.width as u32;
+        let ih = img.height as u32;
+        for py in area.y..area.y + area.h {
+            let sy = (((py - y0) as u32) * ih / dh as u32).min(ih - 1);
+            let row = (sy * iw) as usize * 4;
+            for px in area.x..area.x + area.w {
+                let sx = (((px - x0) as u32) * iw / dw as u32).min(iw - 1);
+                let o = row + sx as usize * 4;
+                let a = img.pixels[o + 3];
+                if a != 0 {
+                    let c = Color { r: img.pixels[o], g: img.pixels[o + 1], b: img.pixels[o + 2], a: 255 };
+                    self.put(px, py, c, a as u32);
+                }
+            }
+        }
+    }
+
     /// Draws `text` with its baseline at y. Returns the advance.
     pub fn text(&mut self, cache: &mut Cache, x: f32, y: f32, text: &str, face: Face, c: Color, letter_spacing: f32) -> f32 {
         let by = y.round() as i32;
@@ -308,7 +340,7 @@ fn side_line(cv: &mut Canvas, r: Rect, horizontal: bool, style: BorderStyle, c: 
 
 /// Paints `page` with page point (0, scroll_y) at canvas (ox, oy), within
 /// the canvas's current clip.
-pub fn paint_page(cv: &mut Canvas, cache: &mut Cache, page: &Page, ox: i32, oy: i32, scroll_y: f32, form: &FormState) {
+pub fn paint_page(cv: &mut Canvas, cache: &mut Cache, page: &Page, images: &HashMap<NodeId, Arc<Image>>, ox: i32, oy: i32, scroll_y: f32, form: &FormState) {
     let view = cv.clip;
     cv.fill(view, page.background);
     let dy = oy as f32 - scroll_y;
@@ -375,22 +407,26 @@ pub fn paint_page(cv: &mut Canvas, cache: &mut Cache, page: &Page, ox: i32, oy: 
                     _ => cv.round_rect(x, y - size / 2.0, *size, *size, size / 2.0, *color),
                 }
             }
-            Item::Image { x, y, w, h, alt } => {
+            Item::Image { x, y, w, h, alt, node } => {
                 let (x, y) = (x + dx, y + dy);
                 let old = cv.push_clip(Rect::new(x.floor() as i32, y.floor() as i32, w.ceil() as i32 + 1, h.ceil() as i32 + 1));
-                cv.round_rect(x, y, *w, *h, 4.0, Color::hex(0xEEF0F5));
-                cv.round_outline(x, y, *w, *h, 4.0, 1.0, Color::hex(0xD5D9E3));
-                let icon = Color::hex(0x9AA1B5);
-                if *h >= 16.0 && *w >= 20.0 {
-                    let ix = if alt.is_empty() { x + w / 2.0 - 7.0 } else { x + 8.0 };
-                    let iy = if alt.is_empty() || *h > 40.0 { y + h / 2.0 - 7.0 } else { y + (h - 12.0) / 2.0 };
-                    let iy = if !alt.is_empty() && *h > 40.0 { y + 8.0 } else { iy };
-                    cv.picture_icon(ix.round() as i32, iy.round() as i32, icon);
-                    if !alt.is_empty() {
-                        let f = Face::new(13.0, false, true, false);
-                        let ty = if *h > 40.0 { y + 19.0 } else { y + h / 2.0 + 5.0 };
-                        let tx = x + 28.0;
-                        cv.text(cache, tx, ty, alt, f, Color::hex(0x5B6275), 0.0);
+                if let Some(img) = node.and_then(|n| images.get(&n)) {
+                    cv.image(x, y, *w, *h, img);
+                } else {
+                    cv.round_rect(x, y, *w, *h, 4.0, Color::hex(0xEEF0F5));
+                    cv.round_outline(x, y, *w, *h, 4.0, 1.0, Color::hex(0xD5D9E3));
+                    let icon = Color::hex(0x9AA1B5);
+                    if *h >= 16.0 && *w >= 20.0 {
+                        let ix = if alt.is_empty() { x + w / 2.0 - 7.0 } else { x + 8.0 };
+                        let iy = if alt.is_empty() || *h > 40.0 { y + h / 2.0 - 7.0 } else { y + (h - 12.0) / 2.0 };
+                        let iy = if !alt.is_empty() && *h > 40.0 { y + 8.0 } else { iy };
+                        cv.picture_icon(ix.round() as i32, iy.round() as i32, icon);
+                        if !alt.is_empty() {
+                            let f = Face::new(13.0, false, true, false);
+                            let ty = if *h > 40.0 { y + 19.0 } else { y + h / 2.0 + 5.0 };
+                            let tx = x + 28.0;
+                            cv.text(cache, tx, ty, alt, f, Color::hex(0x5B6275), 0.0);
+                        }
                     }
                 }
                 cv.clip = old;
