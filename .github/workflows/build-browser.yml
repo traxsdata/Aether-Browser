@@ -76,10 +76,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends binutils jq python3 zip
 
+      # Optimised: the hostile-input tests have time limits meant to catch
+      # blowups in the engine, not the unoptimised build's speed.
       - name: Test
         env:
           AETHER_DIR: ${{ github.workspace }}/aether
-        run: cargo test --locked
+        run: cargo test --release --locked
 
       - name: Build and package
         env:
