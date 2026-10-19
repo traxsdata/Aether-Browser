@@ -463,10 +463,23 @@ fn seg_dist2(px: f32, py: f32, s: (f32, f32, f32, f32)) -> f32 {
 mod tests {
     use super::*;
 
-    /// font_small from include/font_data.h, parsed at test time.
-    fn header_small() -> Vec<Vec<u8>> {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../include/font_data.h");
-        let text = std::fs::read_to_string(path).expect("include/font_data.h");
+    /// font_small from the Aether repository's include/font_data.h, parsed
+    /// at test time: $AETHER_DIR, else a sibling ../Aether checkout. None when
+    /// neither is there and AETHER_DIR is unset (CI sets it, so it runs there).
+    fn header_small() -> Option<Vec<Vec<u8>>> {
+        let dir = std::env::var("AETHER_DIR").ok();
+        let path = match &dir {
+            Some(d) => format!("{d}/include/font_data.h"),
+            None => concat!(env!("CARGO_MANIFEST_DIR"), "/../Aether/include/font_data.h").to_string(),
+        };
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if dir.is_none() => {
+                eprintln!("skipping: no Aether checkout at {path} ({e}); set AETHER_DIR");
+                return None;
+            }
+            Err(e) => panic!("{path}: {e}"),
+        };
         let start = text.find("font_small[").unwrap();
         let body = &text[start..];
         let body = &body[body.find('{').unwrap()..body.find("};").unwrap()];
@@ -481,13 +494,13 @@ mod tests {
             assert_eq!(nums.len(), 128);
             glyphs.push(nums);
         }
-        glyphs
+        Some(glyphs)
     }
 
     #[test]
     fn matches_the_kernel_font() {
         // The kernel's 8x16 cells are our mono face at a cell height of 16.
-        let glyphs = header_small();
+        let Some(glyphs) = header_small() else { return };
         assert_eq!(glyphs.len(), 97);
         let mut total = 0f64;
         let mut count = 0f64;

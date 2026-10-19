@@ -1,5 +1,7 @@
 //! The æther browser engine: HTML, CSS, layout, painting and æther script
-//! (a JavaScript engine), all written from scratch.
+//! (a JavaScript engine), all written from scratch. No `unsafe`: that stays
+//! in aether-host.
+#![forbid(unsafe_code)]
 
 pub mod css;
 pub mod dom;

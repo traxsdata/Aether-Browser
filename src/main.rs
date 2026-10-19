@@ -8,6 +8,8 @@
 //! BROWSER_TEST_ROOT=<dir> serves https://test.aether/ from that folder and
 //! refuses every other address (tests and screenshots without a network).
 
+#![forbid(unsafe_code)]
+
 fn main() {
     let start = std::env::args().nth(1);
     let mut fetcher = browser::page::default_fetcher();

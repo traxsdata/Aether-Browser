@@ -1,7 +1,7 @@
 //! net.rs - the seam between the browser and æther's network layer.
 //!
 //! Everything the browser knows about the network comes through these
-//! re-exports from the `webnet` crate (runner/webnet): URLs, HTTP/1.1 and
+//! re-exports from the `webnet` crate (Aether's runner/webnet): URLs, HTTP/1.1 and
 //! TLS 1.3, with the kernel resolving names and its firewall deciding every
 //! connection. Tests swap the fetch function for `testserve::fetch`.
 

@@ -1,0 +1,4 @@
+/target/
+/build/
+# Headless screenshots (docs/ has the ones worth keeping).
+/shots/

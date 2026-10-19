@@ -1,6 +1,6 @@
 //! Browser behaviour through the window's event handling: navigation,
 //! the http warning, history, links, forms, scrolling and focus. Pages come
-//! from browser::testserve (https://test.aether/ is runner/browser/testpages;
+//! from browser::testserve (https://test.aether/ is testpages;
 //! no network is used).
 
 use aether_host::{abi, Event, Mouse};
