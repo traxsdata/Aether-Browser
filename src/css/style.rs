@@ -179,6 +179,9 @@ pub enum Track {
     AutoFill(f32),
 }
 
+pub const CLEAR_LEFT: u8 = 1;
+pub const CLEAR_RIGHT: u8 = 2;
+
 pub const DECO_UNDERLINE: u8 = 1;
 pub const DECO_OVERLINE: u8 = 2;
 pub const DECO_LINE_THROUGH: u8 = 4;
@@ -188,6 +191,8 @@ pub struct Style {
     pub display: Display,
     pub position: Position,
     pub float: Float,
+    /// clear: CLEAR_LEFT | CLEAR_RIGHT bits.
+    pub clear: u8,
     pub hidden: bool, // visibility: hidden or opacity 0
     pub opacity: f32,
     pub color: Color,
@@ -201,6 +206,8 @@ pub struct Style {
     pub mono: bool,
     pub line_height: LineHeight,
     pub text_align: TextAlign,
+    /// text-align: -webkit-center: block children are centred too.
+    pub center_blocks: bool,
     pub decoration: u8,
     pub decoration_color: Option<Color>,
     pub transform: TextTransform,
@@ -254,6 +261,7 @@ impl Style {
             display: Display::Inline,
             position: Position::Static,
             float: Float::None,
+            clear: 0,
             hidden: false,
             opacity: 1.0,
             color: Color::BLACK,
@@ -266,6 +274,7 @@ impl Style {
             mono: false,
             line_height: LineHeight::Normal,
             text_align: TextAlign::Left,
+            center_blocks: false,
             decoration: 0,
             decoration_color: None,
             transform: TextTransform::None,
@@ -322,6 +331,7 @@ impl Style {
             mono: parent.mono,
             line_height: parent.line_height,
             text_align: parent.text_align,
+            center_blocks: parent.center_blocks,
             transform: parent.transform,
             indent: parent.indent,
             white_space: parent.white_space,
@@ -530,7 +540,21 @@ pub fn compute_styles(doc: &Document, author: &[Stylesheet], env: &MediaEnv) -> 
             stack.push(c);
         }
         let Some(el) = doc.element(n) else { continue };
-        let parent = doc.parent(n).and_then(|p| of[p].clone()).unwrap_or_else(|| root_style.clone());
+        let mut parent = doc.parent(n).and_then(|p| of[p].clone()).unwrap_or_else(|| root_style.clone());
+        if doc.quirks && el.name == "table" {
+            // Quirks mode: tables don't inherit text styles (the HTML
+            // standard's quirks rules for table).
+            let mut p = (*parent).clone();
+            let init = Style::initial();
+            p.font_size = init.font_size;
+            p.weight = init.weight;
+            p.italic = init.italic;
+            p.line_height = init.line_height;
+            p.white_space = init.white_space;
+            p.text_align = init.text_align;
+            p.center_blocks = false;
+            parent = Rc::new(p);
+        }
         cands.clear();
         index.candidates(doc, n, &mut cands);
         let mut decls: Vec<(u8, (u16, u16, u16), u32, usize, &Declaration)> = Vec::new();
@@ -1073,6 +1097,15 @@ pub fn apply(s: &mut Style, parent: &Style, name: &str, v: &[Cv], u: &Units) {
                 _ => return,
             }
         }
+        "clear" => {
+            s.clear = match id {
+                Some("left") | Some("inline-start") => CLEAR_LEFT,
+                Some("right") | Some("inline-end") => CLEAR_RIGHT,
+                Some("both") => CLEAR_LEFT | CLEAR_RIGHT,
+                Some("none") => 0,
+                _ => return,
+            }
+        }
         "visibility" => match id {
             Some("hidden") | Some("collapse") => s.hidden = true,
             Some("visible") => s.hidden = false,
@@ -1213,6 +1246,12 @@ pub fn apply(s: &mut Style, parent: &Style, name: &str, v: &[Cv], u: &Units) {
             }
         }
         "text-align" => {
+            // The legacy -webkit-center (<center>, align=center) also
+            // centres block children narrower than the line.
+            let legacy = matches!(id, Some("-webkit-center") | Some("-moz-center"));
+            if id.is_some() && !matches!(id, Some("inherit") | Some("initial") | Some("unset")) {
+                s.center_blocks = legacy;
+            }
             s.text_align = match id {
                 Some("left") | Some("start") | Some("-webkit-left") => TextAlign::Left,
                 Some("right") | Some("end") | Some("-webkit-right") => TextAlign::Right,
@@ -1726,13 +1765,24 @@ fn presentational_hints(doc: &Document, n: NodeId) -> Vec<Declaration> {
             }
             ("td" | "th" | "tr" | "div" | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "thead" | "tbody" | "tfoot" | "caption", "align") => {
                 let a = v.to_ascii_lowercase();
-                if ["left", "right", "center", "justify"].contains(&a.as_str()) {
+                if ["left", "right", "justify"].contains(&a.as_str()) {
                     css += &format!("text-align:{a};");
+                } else if a == "center" {
+                    css += "text-align:-webkit-center;";
                 }
             }
             ("table", "align") if v.eq_ignore_ascii_case("center") => css += "margin-left:auto;margin-right:auto;",
             ("img" | "table", "align") if v.eq_ignore_ascii_case("left") || v.eq_ignore_ascii_case("right") => {
                 css += &format!("float:{};", v.to_ascii_lowercase())
+            }
+            ("br", "clear") => {
+                let c = match v.trim().to_ascii_lowercase().as_str() {
+                    "left" => "left",
+                    "right" => "right",
+                    "all" | "both" => "both",
+                    _ => continue,
+                };
+                css += &format!("clear:{c};");
             }
             ("td" | "th" | "tr" | "tbody" | "thead", "valign") => css += &format!("vertical-align:{};", v.to_ascii_lowercase()),
             ("td" | "th", "nowrap") => css += "white-space:nowrap;",

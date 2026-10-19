@@ -16,7 +16,8 @@ enum P<'a> {
     Atomic { b: &'a LBox, link: Option<u32> },
     Open { ts: &'a Rc<TextStyle>, w: f32, node: Option<NodeId> },
     Close { w: f32 },
-    Break,
+    /// A forced break, with the `clear` of a <br>.
+    Break(u8),
 }
 
 fn text_w(ts: &TextStyle, s: &str) -> f32 {
@@ -43,7 +44,7 @@ fn pieces(inl: &[Inl]) -> Vec<P<'_>> {
                     }
                     flush_word(&mut word, &mut out, ts);
                     if c == '\n' && ws.keeps_newlines() {
-                        out.push(P::Break);
+                        out.push(P::Break(0));
                         after_space = true;
                         continue;
                     }
@@ -66,8 +67,8 @@ fn pieces(inl: &[Inl]) -> Vec<P<'_>> {
                 out.push(P::Atomic { b, link: *link });
                 after_space = false;
             }
-            Inl::Br(_) => {
-                out.push(P::Break);
+            Inl::Br(ts) => {
+                out.push(P::Break(ts.clear));
                 after_space = true;
             }
         }
@@ -83,7 +84,7 @@ fn flush_word<'a>(word: &mut String, out: &mut Vec<P<'a>>, ts: &'a Rc<TextStyle>
 }
 
 fn is_break_point(p: &P) -> bool {
-    matches!(p, P::Space { brk: true, .. } | P::Break | P::Atomic { .. })
+    matches!(p, P::Space { brk: true, .. } | P::Break(_) | P::Atomic { .. })
 }
 
 struct AtomicInfo {
@@ -98,6 +99,22 @@ struct AtomicInfo {
     valign: VAlign,
     /// Absolutely positioned: takes no space in the line.
     abs: bool,
+    /// Floated (Some(true) left, Some(false) right): out of the line.
+    float: Option<bool>,
+    clear: u8,
+}
+
+/// A broken line, before it is emitted.
+struct LineRec {
+    placed: Vec<Placed>,
+    forced: bool,
+    /// Top, and the free span (relative to the container) beside the floats.
+    y: f32,
+    left: f32,
+    avail: f32,
+    above: f32,
+    below: f32,
+    visible: bool,
 }
 
 #[derive(Debug)]
@@ -139,7 +156,7 @@ impl Flow {
                     mn = mn.max(amn + m);
                     line += amx + m;
                 }
-                P::Break => {
+                P::Break(_) => {
                     mn = mn.max(unit);
                     unit = 0.0;
                     mx = mx.max(line);
@@ -162,6 +179,7 @@ impl Flow {
         }
         // Size the atomic inlines first (laid out at the origin, moved later).
         let mut atomics: Vec<Option<AtomicInfo>> = Vec::with_capacity(ps.len());
+        let mut floats_seen = self.floats.len();
         for p in &ps {
             if let P::Atomic { b: ab, .. } = p {
                 let st = &ab.style;
@@ -174,7 +192,13 @@ impl Flow {
                 let laid = self.layout_box(ab, 0.0, 0.0, w, cw, None);
                 let end = self.items.len();
                 let abs = matches!(st.position, Position::Absolute | Position::Fixed);
-                atomics.push(Some(AtomicInfo { w, ml, mr, mt, mb, start, end, laid, valign: st.valign, abs }));
+                let float = if st.is_float() && floats_seen < super::flow::MAX_FLOATS {
+                    floats_seen += 1;
+                    Some(st.float == crate::css::style::Float::Left)
+                } else {
+                    None
+                };
+                atomics.push(Some(AtomicInfo { w, ml, mr, mt, mb, start, end, laid, valign: st.valign, abs, float, clear: st.clear }));
             } else {
                 atomics.push(None);
             }
@@ -182,37 +206,74 @@ impl Flow {
         let width_of = |i: usize, p: &P| -> f32 {
             match p {
                 P::Word { w, .. } | P::Space { w, .. } | P::Open { w, .. } | P::Close { w } => *w,
-                P::Atomic { .. } => atomics[i].as_ref().map_or(0.0, |a| if a.abs { 0.0 } else { a.w + a.ml + a.mr }),
-                P::Break => 0.0,
+                P::Atomic { .. } => atomics[i].as_ref().map_or(0.0, |a| if a.abs || a.float.is_some() { 0.0 } else { a.w + a.ml + a.mr }),
+                P::Break(_) => 0.0,
             }
         };
-        // Line breaking.
+        // Line breaking, one line at a time: each line's span between the
+        // floats depends on where the lines above it ended.
         let indent = s.indent.or_zero(Some(cw));
-        let mut lines: Vec<(Vec<Placed>, bool)> = Vec::new();
+        let face = s.face();
+        let lh = s.line_px();
+        let half = (lh - (face.ascent() + face.descent())) / 2.0;
+        let strut = (face.ascent() + half, face.descent() + half);
+        let xh = s.font_size * 0.25;
+        let x_end = cx + cw;
+        let mut lines: Vec<LineRec> = Vec::new();
         let mut line: Vec<Placed> = Vec::new();
+        let mut y = cy;
+        let (l0, r0) = self.band(y, lh, cx, x_end);
+        let mut left = l0 - cx;
+        let mut avail = r0 - l0;
         let mut x = indent;
         let mut content = false;
+        let mut pending: Vec<usize> = Vec::new();
+        let mut float_top = f32::MIN;
         let mut i = 0;
-        let finish = |line: &mut Vec<Placed>, lines: &mut Vec<(Vec<Placed>, bool)>, forced: bool| {
-            // Trailing collapsible spaces hang off the end and are dropped.
-            let mut k = line.len();
-            while k > 0 {
-                match &ps[line[k - 1].idx] {
-                    P::Close { .. } => k -= 1,
-                    P::Space { collapsible: true, .. } => {
-                        line.remove(k - 1);
-                        k -= 1;
+        macro_rules! reband {
+            () => {{
+                let (l, r) = self.band(y, lh, cx, x_end);
+                left = l - cx;
+                avail = r - l;
+            }};
+        }
+        macro_rules! finish {
+            ($forced:expr) => {{
+                // Trailing collapsible spaces hang off the end and are dropped.
+                let mut k = line.len();
+                while k > 0 {
+                    match &ps[line[k - 1].idx] {
+                        P::Close { .. } => k -= 1,
+                        P::Space { collapsible: true, .. } => {
+                            line.remove(k - 1);
+                            k -= 1;
+                        }
+                        _ => break,
                     }
-                    _ => break,
                 }
-            }
-            lines.push((std::mem::take(line), forced));
-        };
+                let (above, below, visible) = line_metrics(&line, &ps, &atomics, strut, xh, $forced);
+                lines.push(LineRec { placed: std::mem::take(&mut line), forced: $forced, y, left, avail, above, below, visible });
+                if visible {
+                    y += (above + below).max(0.0);
+                }
+                // Floats that didn't fit beside the line go below it.
+                for fi in std::mem::take(&mut pending) {
+                    if let (Some(a), P::Atomic { link, .. }) = (atomics[fi].as_ref(), &ps[fi]) {
+                        self.place_float(a, *link, y, cx, x_end, &mut float_top);
+                    }
+                }
+                reband!();
+            }};
+        }
         while i < ps.len() {
             match &ps[i] {
-                P::Break => {
+                P::Break(clear) => {
                     line.push(Placed { idx: i, x, w: 0.0, text: None });
-                    finish(&mut line, &mut lines, true);
+                    finish!(true);
+                    if *clear != 0 {
+                        y = self.clear_y(y, *clear);
+                        reband!();
+                    }
                     x = 0.0;
                     content = false;
                     i += 1;
@@ -225,6 +286,18 @@ impl Flow {
                     }
                     i += 1;
                     continue;
+                }
+                P::Atomic { link, .. } => {
+                    if let Some(a) = atomics[i].as_ref().filter(|a| a.float.is_some()) {
+                        if content && x + a.w + a.ml + a.mr > avail + 0.01 {
+                            pending.push(i);
+                        } else {
+                            self.place_float(a, *link, y, cx, x_end, &mut float_top);
+                            reband!();
+                        }
+                        i += 1;
+                        continue;
+                    }
                 }
                 _ => {}
             }
@@ -244,26 +317,34 @@ impl Flow {
                 P::Word { ts, .. } | P::Space { ts, .. } | P::Open { ts, .. } => ts.ws.wraps(),
                 _ => true,
             };
-            if wraps && content && x + unit_w > cw + 0.01 {
-                finish(&mut line, &mut lines, false);
+            if wraps && content && x + unit_w > avail + 0.01 {
+                finish!(false);
                 x = 0.0;
                 content = false;
             }
-            if unit_w > cw && x <= 0.01 && wraps {
+            if !content && x + unit_w > avail + 0.01 && (left > 0.01 || avail < cw - 0.01) {
+                // Too wide beside the floats: try below the nearest one.
+                if let Some(b) = self.next_float_bottom(y, lh, cx, x_end).filter(|&b| b > y) {
+                    y = b;
+                    reband!();
+                    continue;
+                }
+            }
+            if unit_w > avail && x <= 0.01 && wraps {
                 // Too long for any line: break inside words.
                 for k in i..j {
                     let pw = width_of(k, &ps[k]);
                     if let P::Word { ts, text, .. } = &ps[k] {
-                        if x + pw > cw {
+                        if x + pw > avail {
                             let mut part = String::new();
                             let mut pw2 = 0.0;
                             for ch in text.chars() {
                                 let cwid = text_w(ts, ch.encode_utf8(&mut [0; 4]));
-                                if x + pw2 + cwid > cw && (pw2 > 0.0 || x > 0.0) {
+                                if x + pw2 + cwid > avail && (pw2 > 0.0 || x > 0.0) {
                                     if !part.is_empty() {
                                         line.push(Placed { idx: k, x, w: pw2, text: Some(std::mem::take(&mut part)) });
                                     }
-                                    finish(&mut line, &mut lines, false);
+                                    finish!(false);
                                     x = 0.0;
                                     pw2 = 0.0;
                                 }
@@ -294,23 +375,18 @@ impl Flow {
             }
             i = j;
         }
-        if !line.is_empty() {
-            finish(&mut line, &mut lines, false);
+        if !line.is_empty() || !pending.is_empty() {
+            finish!(false);
         }
+        let _ = (left, avail); // the last finish! recomputes them for a next line
+        let end_y = y;
         // Emit the lines.
-        let face = s.face();
-        let lh = s.line_px();
-        let half = (lh - (face.ascent() + face.descent())) / 2.0;
-        let strut = (face.ascent() + half, face.descent() + half);
-        let xh = s.font_size * 0.25;
-        let mut y = cy;
         let mut first = None;
         let mut last = None;
         let nlines = lines.len();
-        for (li, (line, forced)) in lines.iter().enumerate() {
-            let visible = *forced
-                || line.iter().any(|p| matches!(ps[p.idx], P::Word { .. } | P::Atomic { .. } | P::Space { collapsible: false, .. }))
-                || line.iter().any(|p| matches!(ps[p.idx], P::Open { w, .. } if w > 0.0));
+        for (li, rec) in lines.iter().enumerate() {
+            let LineRec { placed: line, forced, y, left, avail, above, below, visible } = rec;
+            let (y, left, avail, above, below) = (*y, *left, *avail, *above, *below);
             if !visible {
                 // Anchors on an otherwise empty line still get a position.
                 for p in line {
@@ -320,31 +396,13 @@ impl Flow {
                 }
                 continue;
             }
-            let (mut above, mut below) = strut;
-            for p in line {
-                match &ps[p.idx] {
-                    P::Word { ts, .. } | P::Space { ts, .. } | P::Open { ts, .. } => {
-                        let f = ts.face;
-                        let hl = (ts.line_h - (f.ascent() + f.descent())) / 2.0;
-                        above = above.max(f.ascent() + hl + ts.shift);
-                        below = below.max(f.descent() + hl - ts.shift);
-                    }
-                    P::Atomic { .. } => {
-                        let a = atomics[p.idx].as_ref().unwrap();
-                        let (asc, desc) = atomic_metrics(a, xh);
-                        above = above.max(asc);
-                        below = below.max(desc);
-                    }
-                    _ => {}
-                }
-            }
             let line_h = (above + below).max(0.0);
             let base = y + above;
             let end_x = line.last().map_or(0.0, |p| {
                 let ml = atomics[p.idx].as_ref().map_or(0.0, |a| a.ml);
                 p.x - ml + p.w
             });
-            let free = cw - end_x;
+            let free = avail - end_x;
             let last_line = li + 1 == nlines;
             let spaces = line.iter().filter(|p| matches!(ps[p.idx], P::Space { .. })).count();
             let (offset, extra) = match s.text_align {
@@ -365,7 +423,7 @@ impl Flow {
                 }
             };
             for p in line {
-                let px = cx + offset + p.x + add;
+                let px = cx + left + offset + p.x + add;
                 match &ps[p.idx] {
                     P::Word { ts, text, .. } => {
                         let t = p.text.as_deref().unwrap_or(text);
@@ -435,7 +493,7 @@ impl Flow {
                             first = Some(base);
                         }
                     }
-                    P::Close { .. } | P::Break => {}
+                    P::Close { .. } | P::Break(_) => {}
                 }
             }
             flush(self, &mut run);
@@ -443,9 +501,30 @@ impl Flow {
                 first = Some(base);
             }
             last = Some(base);
-            y += line_h;
         }
-        ((y - cy).max(0.0), first, last)
+        ((end_y - cy).max(0.0), first, last)
+    }
+
+    /// Puts a float at the highest place at or below `y` where it fits
+    /// beside the floats already there, and records it.
+    fn place_float(&mut self, a: &AtomicInfo, link: Option<u32>, y: f32, cx: f32, x_end: f32, float_top: &mut f32) {
+        let fw = a.w + a.ml.max(0.0) + a.mr.max(0.0);
+        let fh = (a.laid.h + a.mt + a.mb).max(0.0);
+        // Not above an earlier float, and below the floats it clears.
+        let y0 = self.clear_y(y.max(*float_top), a.clear);
+        let (fy, l, r) = self.fit(y0, fh, fw, cx, x_end);
+        let left = a.float == Some(true);
+        let bx = if left { l } else { (r - fw).max(l) };
+        let px = bx + a.ml.max(0.0);
+        let top = fy + a.mt;
+        self.shift_from_range(a.start, a.end, px, top);
+        if let Some(l) = link {
+            self.push(Item::Hit { x: px, y: top, w: a.w, h: a.laid.h, target: Target::Link(l) });
+        }
+        *float_top = fy;
+        if self.floats.len() < super::flow::MAX_FLOATS {
+            self.floats.push(super::flow::FloatBox { left, x0: bx, x1: bx + fw, y0: fy, y1: fy + fh });
+        }
     }
 
     fn emit_run(&mut self, ts: &TextStyle, x: f32, base: f32, text: &str, w: f32, line_y: f32, line_h: f32) {
@@ -478,6 +557,34 @@ impl Flow {
             }
         }
     }
+}
+
+/// A line's (above, below) its baseline, and whether it shows anything
+/// (empty lines take no space).
+fn line_metrics(line: &[Placed], ps: &[P], atomics: &[Option<AtomicInfo>], strut: (f32, f32), xh: f32, forced: bool) -> (f32, f32, bool) {
+    let visible = forced
+        || line.iter().any(|p| matches!(ps[p.idx], P::Word { .. } | P::Atomic { .. } | P::Space { collapsible: false, .. }))
+        || line.iter().any(|p| matches!(ps[p.idx], P::Open { w, .. } if w > 0.0));
+    let (mut above, mut below) = strut;
+    for p in line {
+        match &ps[p.idx] {
+            P::Word { ts, .. } | P::Space { ts, .. } | P::Open { ts, .. } => {
+                let f = ts.face;
+                let hl = (ts.line_h - (f.ascent() + f.descent())) / 2.0;
+                above = above.max(f.ascent() + hl + ts.shift);
+                below = below.max(f.descent() + hl - ts.shift);
+            }
+            P::Atomic { .. } => {
+                if let Some(a) = atomics[p.idx].as_ref() {
+                    let (asc, desc) = atomic_metrics(a, xh);
+                    above = above.max(asc);
+                    below = below.max(desc);
+                }
+            }
+            _ => {}
+        }
+    }
+    (above, below, visible)
 }
 
 /// (above, below) the baseline for an atomic inline, margins included.

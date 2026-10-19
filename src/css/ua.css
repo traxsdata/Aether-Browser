@@ -17,7 +17,7 @@ p, dl, multicol { margin: 1em 0 }
 blockquote, figure { margin: 1em 40px }
 dd { margin-left: 40px }
 address { font-style: italic }
-center { text-align: center }
+center { text-align: -webkit-center }
 
 h1 { font-size: 2em; margin: .67em 0 }
 h2 { font-size: 1.5em; margin: .83em 0 }
