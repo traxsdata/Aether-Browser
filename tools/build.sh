@@ -41,6 +41,10 @@ done
 
 set -- cargo build --release --target x86_64-unknown-linux-musl
 if [ -n "$local_aether" ]; then
+    # The patch rewrites Cargo.lock's sources; put the pinned one back after.
+    mkdir -p build
+    cp Cargo.lock build/Cargo.lock.pinned
+    trap 'cp build/Cargo.lock.pinned Cargo.lock' EXIT
     git='patch."https://github.com/traxsdata/Aether"'
     set -- "$@" --config "$git.aether-host.path=\"$AETHER_DIR/runner/aether-host\"" \
         --config "$git.webnet.path=\"$AETHER_DIR/runner/webnet\""
